@@ -199,7 +199,8 @@ export class EnterWatchTool extends Tool {
   constructor(onEnter) {
     super({
       name: 'EnterWatch',
-      description: '进入持续模式（watch）：本轮结束后不主动停止回复，持续执行/监听，直到 ExitWatch 或用户打断（Ctrl+C）。仅在任务确实是「持续性」的（盯队列、轮询状态、持续下歌等）才用；一次性任务不要开。主对话专用。',
+      description: '进入持续模式（watch）：本轮结束后不主动停止回复，持续执行/监听，直到 ExitWatch 或用户打断（Ctrl+C）。仅在任务确实是「持续性」的（盯队列、轮询状态、持续下歌等）才用；一次性任务不要开。主对话专用。'
+        + '【纪律】任务完成后必须主动 ExitWatch，不要空转等用户来叫 —— 没有新任务、或只剩「等外部条件」（等构建、等账号恢复、等用户回话）时，都应该退出而不是挂着。用户反复看到你在空转是骚扰。',
       input_schema: { type: 'object', properties: {} },
     })
     this.onEnter = onEnter
@@ -214,7 +215,7 @@ export class ExitWatchTool extends Tool {
   constructor(onExit) {
     super({
       name: 'ExitWatch',
-      description: '退出持续模式（watch），恢复正常「一轮结束即停」。持续任务已完成或不再有时调用。',
+      description: '退出持续模式（watch），恢复正常「一轮结束即停」。持续任务已完成、或只剩「等外部条件」（等构建/等回复/等账号恢复）而非主动监听时调用 —— 那些场景该用 ScheduleWakeup 定时唤醒，而不是挂着 watch 空转。',
       input_schema: { type: 'object', properties: {} },
     })
     this.onExit = onExit
