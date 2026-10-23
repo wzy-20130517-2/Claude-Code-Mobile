@@ -3,7 +3,9 @@
 
 import { spawn, execFileSync } from 'node:child_process'
 import { readFileSync, existsSync, statSync } from 'node:fs'
-import { resolve, extname, dirname } from 'node:path'
+import { resolve, extname, dirname, relative, isAbsolute } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { Tool } from './tools.mjs'
 
 // ─────────────────────────────────────────────────────────────
 // LSP Server 配置：按文件扩展名路由
@@ -139,7 +141,11 @@ class LspClient {
           hover: { contentFormat: ['markdown', 'plaintext'] },
           definition: { linkSupport: false },
           completion: { completionItem: { snippetSupport: false } },
+          references: {},
+          documentSymbol: { hierarchicalDocumentSymbolSupport: true },
+          implementation: { linkSupport: false },
         },
+        workspace: { symbol: {} },
       },
       rootUri: `file://${this.config.cwd || process.cwd()}`,
       initializationOptions: this.config.initOptions || {},
@@ -335,6 +341,42 @@ class LspClient {
     return result
   }
 
+  async references(filePath, line, character, includeDeclaration = true) {
+    await this.openFile(filePath)
+    return this._send('textDocument/references', {
+      textDocument: { uri: `file://${filePath}` },
+      position: { line, character },
+      context: { includeDeclaration },
+    })
+  }
+
+  async documentSymbol(filePath) {
+    await this.openFile(filePath)
+    return this._send('textDocument/documentSymbol', {
+      textDocument: { uri: `file://${filePath}` },
+    })
+  }
+
+  async implementation(filePath, line, character) {
+    await this.openFile(filePath)
+    return this._send('textDocument/implementation', {
+      textDocument: { uri: `file://${filePath}` },
+      position: { line, character },
+    })
+  }
+
+  // workspace/symbol 与具体文件无关，但仍需要 server 已起来；
+  // 拿不到 filePath 时调用方会传同语言的任意文件来定语言。
+  //
+  // 必须先 openFile 一个文件：tsserver 在没有任何打开文件时没有 project，
+  // 直接 workspace/symbol 会回 "TypeScript Server Error: No Project"
+  // （实测：全新进程首个调用必现，同进程先做过 definition 就正常 —— 极隐蔽）。
+  async workspaceSymbol(query, hintFilePath) {
+    await this._ensureStarted()
+    if (hintFilePath) await this.openFile(hintFilePath)
+    return this._send('workspace/symbol', { query })
+  }
+
   async shutdown() {
     if (!this.proc || this.proc.exitCode !== null) return
     this.shuttingDown = true
@@ -393,8 +435,21 @@ class LspManager {
           return await client.hover(filePath, params.line - 1, params.character - 1)
         case 'definition':
           return await client.definition(filePath, params.line - 1, params.character - 1)
+        case 'references':
+          return await client.references(
+            filePath,
+            params.line - 1,
+            params.character - 1,
+            params.includeDeclaration !== false
+          )
+        case 'implementation':
+          return await client.implementation(filePath, params.line - 1, params.character - 1)
         case 'completion':
           return await client.completion(filePath, params.line - 1, params.character - 1)
+        case 'documentSymbol':
+          return await client.documentSymbol(filePath)
+        case 'workspaceSymbol':
+          return await client.workspaceSymbol(params.query || '', filePath)
         default:
           return { error: `未知操作: ${action}` }
       }
@@ -463,3 +518,294 @@ function parsePyrightErrors(output) {
 }
 
 export { lspManager, SERVER_CONFIGS, getLanguage }
+
+// ─────────────────────────────────────────────────────────────
+// LSP 工具：把 LspClient 已有的能力暴露给模型
+// 对齐官方设计：一个工具 + operation 字段分派（官方 dreamTask.js:4806）
+// 行号入参统一 1-based（与 Read/HashlineRead 一致），内部转 0-based 给 LSP
+// ─────────────────────────────────────────────────────────────
+
+// LSP SymbolKind → 人类可读（与官方 dreamTask.js 的映射一致）
+const SYMBOL_KINDS = {
+  1: 'File', 2: 'Module', 3: 'Namespace', 4: 'Package', 5: 'Class', 6: 'Method',
+  7: 'Property', 8: 'Field', 9: 'Constructor', 10: 'Enum', 11: 'Interface',
+  12: 'Function', 13: 'Variable', 14: 'Constant', 15: 'String', 16: 'Number',
+  17: 'Boolean', 18: 'Array', 19: 'Object', 20: 'Key', 21: 'Null', 22: 'EnumMember',
+  23: 'Struct', 24: 'Event', 25: 'Operator', 26: 'TypeParameter',
+}
+
+// hover.contents 可能是字符串 / {value} / {language,value} / 数组
+function flattenHoverContents(contents) {
+  const pick = (c) => (typeof c === 'string' ? c : (c && typeof c.value === 'string' ? c.value : ''))
+  if (Array.isArray(contents)) return contents.map(pick).filter(Boolean).join('\n\n')
+  return pick(contents)
+}
+
+// LSP uri（file:///abs/path）→ 绝对路径
+function uriToPath(uri) {
+  if (typeof uri !== 'string') return ''
+  if (!uri.startsWith('file://')) return uri
+  try { return fileURLToPath(uri) } catch { return decodeURIComponent(uri.replace(/^file:\/\//, '')) }
+}
+
+// 显示路径：能相对 cwd 就用相对（短，且和 Read 的入参风格一致）
+function displayPath(absPath, cwd) {
+  if (!absPath) return ''
+  if (cwd && isAbsolute(absPath)) {
+    const rel = relative(cwd, absPath)
+    if (rel && !rel.startsWith('..') && !isAbsolute(rel)) return rel
+  }
+  return absPath
+}
+
+// 读文件某一行内容，失败返回空串（文件被删/越界不该让整个工具失败）
+function safeReadLine(absPath, lineNo) {
+  try {
+    const lines = readFileSync(absPath, 'utf8').split('\n')
+    return (lines[lineNo] ?? '').trim()
+  } catch { return '' }
+}
+
+// 单条 location → `路径:行:列` + 该行内容（CCM 提示词要求引用代码用 file_path:line_number）
+function formatLocation(loc, cwd) {
+  if (!loc) return ''
+  const abs = uriToPath(loc.uri)
+  const line = (loc.range?.start?.line ?? 0) + 1
+  const char = (loc.range?.start?.character ?? 0) + 1
+  const p = displayPath(abs, cwd)
+  const text = safeReadLine(abs, line - 1)
+  return text ? `${p}:${line}:${char}  ${text}` : `${p}:${line}:${char}`
+}
+
+// LocationLink（targetUri 形式）→ 普通 location
+function normalizeLocation(loc) {
+  if (!loc || typeof loc !== 'object') return null
+  if (typeof loc.targetUri === 'string') {
+    return { uri: loc.targetUri, range: loc.targetSelectionRange || loc.targetRange || loc.range }
+  }
+  if (typeof loc.uri !== 'string') return null
+  return loc
+}
+
+function toLocationArray(result) {
+  if (!result) return []
+  const arr = Array.isArray(result) ? result : [result]
+  return arr.map(normalizeLocation).filter(l => l && l.uri)
+}
+
+// LSP CompletionItemKind 是另一套枚举（与 SymbolKind 差 1），别混用 ——
+// 混用的表现是 completion 的 kind 全错位（Method 其实是 Text）。
+const COMPLETION_KINDS = {
+  1: 'Text', 2: 'Method', 3: 'Function', 4: 'Constructor', 5: 'Field',
+  6: 'Variable', 7: 'Class', 8: 'Interface', 9: 'Module', 10: 'Property',
+  11: 'Unit', 12: 'Value', 13: 'Enum', 14: 'Keyword', 15: 'Snippet',
+  16: 'Color', 17: 'File', 18: 'Reference', 19: 'Folder', 20: 'EnumMember',
+  21: 'Constant', 22: 'Struct', 23: 'Event', 24: 'Operator', 25: 'TypeParameter',
+}
+
+// documentSymbol 结果按文件分组（多位置时读起来更清楚）
+function groupByFile(locs, cwd) {
+  const map = new Map()
+  for (const loc of locs) {
+    const abs = uriToPath(loc.uri)
+    const key = displayPath(abs, cwd)
+    if (!map.has(key)) map.set(key, [])
+    map.get(key).push(loc)
+  }
+  return map
+}
+
+function formatSymbolList(symbols, cwd) {
+  const lines = []
+  const walk = (list, depth) => {
+    for (const s of list) {
+      if (!s || typeof s.name !== 'string') continue
+      const kind = SYMBOL_KINDS[s.kind] || 'Unknown'
+      const indent = '  '.repeat(depth)
+      const loc = normalizeLocation(s.location) || (s.range ? { uri: s.uri, range: s.range } : null)
+      const line = loc?.range?.start?.line
+      let text = `${indent}${s.name} (${kind})`
+      if (s.detail) text += ` ${s.detail}`
+      if (line !== undefined) {
+        const p = loc ? displayPath(uriToPath(loc.uri), cwd) : ''
+        text += p ? ` - ${p}:${line + 1}` : ` - 行 ${line + 1}`
+      }
+      lines.push(text)
+      if (Array.isArray(s.children) && s.children.length > 0) walk(s.children, depth + 1)
+    }
+  }
+  walk(symbols, 0)
+  return lines
+}
+
+// 官方 operations 里没有 completion，CCM 的 LspClient 有 —— 保留但不写进
+// 官方那份 description 措辞，避免和官方语义漂移
+const OPERATIONS = [
+  'definition', 'references', 'hover', 'documentSymbol',
+  'workspaceSymbol', 'implementation', 'completion',
+]
+
+export class LspTool extends Tool {
+  constructor() {
+    super({
+      name: 'LSP',
+      description: [
+        'Interact with Language Server Protocol (LSP) servers to get code intelligence features.',
+        '',
+        'Supported operations:',
+        '- definition: Find where a symbol is defined',
+        '- references: Find all references to a symbol',
+        '- hover: Get hover information (documentation, type info) for a symbol',
+        '- documentSymbol: Get all symbols (functions, classes, variables) in a document',
+        '- workspaceSymbol: Search for symbols matching a query across the workspace',
+        '- implementation: Find implementations of an interface or abstract method',
+        '- completion: Get completion items at a position',
+        '',
+        'All operations require:',
+        '- filePath: The file to operate on',
+        '- line: The line number (1-based, as shown in editors)',
+        '- character: The character offset (1-based, as shown in editors)',
+        '',
+        'The workspaceSymbol operation also takes:',
+        '- query: The symbol name or partial name to search for. Always provide it.',
+        '',
+        'Note: LSP servers must be configured for the file type (.js/.ts/.mjs/.py).',
+      ].join('\n'),
+      input_schema: {
+        type: 'object',
+        properties: {
+          operation: {
+            type: 'string',
+            enum: OPERATIONS,
+            description: 'The LSP operation to perform',
+          },
+          filePath: {
+            type: 'string',
+            description: 'The absolute or relative path to the file',
+          },
+          line: {
+            type: 'integer',
+            description: 'The line number (1-based, as shown in editors)',
+          },
+          character: {
+            type: 'integer',
+            description: 'The character offset (1-based, as shown in editors)',
+          },
+          query: {
+            type: 'string',
+            description: 'The symbol name or partial name to search for (workspaceSymbol only)',
+          },
+        },
+        required: ['operation', 'filePath'],
+      },
+      isReadOnly: () => true,
+      isConcurrencySafe: () => false,  // LSP 内部有状态，避免并发
+      maxResultSizeChars: 30000,
+      userFacingName: 'LSP',
+      validateInput: (input) => {
+        const errors = []
+        if (!OPERATIONS.includes(input.operation)) {
+          errors.push(`operation 必须是: ${OPERATIONS.join(' / ')}`)
+        }
+        if (!input.filePath) errors.push('filePath is required')
+        // documentSymbol / workspaceSymbol 不按位置取结果
+        const needsPosition = input.operation !== 'documentSymbol' && input.operation !== 'workspaceSymbol'
+        if (needsPosition && (typeof input.line !== 'number' || typeof input.character !== 'number')) {
+          errors.push(`${input.operation} 需要 line 和 character（1-based）`)
+        }
+        if (input.operation === 'workspaceSymbol' && !input.query) {
+          errors.push('workspaceSymbol 需要 query')
+        }
+        return { valid: errors.length === 0, errors }
+      },
+    })
+  }
+
+  async execute(input, ctx = {}) {
+    const cwd = ctx.cwd || process.cwd()
+    const abs = resolve(cwd, input.filePath)
+    if (!existsSync(abs)) return `文件不存在: ${abs}`
+
+    const result = await lspManager.run(abs, input.operation, {
+      line: input.line,
+      character: input.character,
+      query: input.query,
+      includeDeclaration: input.includeDeclaration,
+    }, cwd)
+
+    if (result && result.error && !result.items) {
+      return `LSP 失败 (${input.operation}): ${result.error}`
+    }
+
+    switch (input.operation) {
+      case 'definition':
+      case 'references':
+      case 'implementation': {
+        const locs = toLocationArray(result)
+        if (locs.length === 0) {
+          return `没有找到 ${input.operation} 结果。可能是光标不在符号上，或该符号在未被索引的外部库里。`
+        }
+        const label = { definition: '定义', references: '引用', implementation: '实现' }[input.operation]
+        if (locs.length === 1) {
+          return `找到 1 个${label}:\n  ${formatLocation(locs[0], cwd)}`
+        }
+        const groups = groupByFile(locs, cwd)
+        const head = [`找到 ${locs.length} 个${label}，分布在 ${groups.size} 个文件:`]
+        for (const [file, fileLocs] of groups) {
+          head.push(`${file}:`)
+          for (const loc of fileLocs) head.push(`  ${formatLocation(loc, cwd).replace(/^[^:]*:/, '')}`)
+        }
+        return head.join('\n')
+      }
+
+      case 'hover': {
+        const text = flattenHoverContents(result?.contents)
+        if (!text) return '该位置没有 hover 信息。'
+        const start = result.range?.start
+        const at = start ? `${start.line + 1}:${start.character + 1} ` : ''
+        return `${at}的 hover 信息:\n\n${text}`
+      }
+
+      case 'documentSymbol': {
+        const symbols = Array.isArray(result) ? result : []
+        if (symbols.length === 0) {
+          return `文档中没有符号，或该文件类型不受 LSP 支持。`
+        }
+        return [`${displayPath(abs, cwd)} 的符号:`].concat(formatSymbolList(symbols, cwd)).join('\n')
+      }
+
+      case 'workspaceSymbol': {
+        const symbols = Array.isArray(result) ? result : []
+        const valid = symbols.filter(s => s && s.location && s.location.uri)
+        if (valid.length === 0) {
+          return `工作区中没有匹配 "${input.query}" 的符号。`
+        }
+        const head = [`工作区中找到 ${valid.length} 个匹配 "${input.query}" 的符号:`]
+        // 直接列表，每行自带完整「路径:行号」—— 模型可直接引用、用户可直接跳。
+        // 不再按文件分组：分组标题已经写过路径，行里再写就重复了。
+        for (const s of valid) {
+          const p = displayPath(uriToPath(s.location.uri), cwd)
+          const kind = SYMBOL_KINDS[s.kind] || 'Unknown'
+          const line = s.location.range?.start?.line ?? 0
+          let text = `  ${s.name} (${kind}) - ${p}:${line + 1}`
+          if (s.containerName) text += ` in ${s.containerName}`
+          head.push(text)
+        }
+        return head.join('\n')
+      }
+
+      case 'completion': {
+        const items = Array.isArray(result?.items) ? result.items : (Array.isArray(result) ? result : [])
+        if (items.length === 0) return '该位置没有补全项。'
+        const lines = items.slice(0, 50).map(it => {
+          const kind = COMPLETION_KINDS[it.kind] || 'Unknown'
+          return `  ${it.label} (${kind})${it.detail ? ` ${it.detail}` : ''}`
+        })
+        return [`找到 ${items.length} 个补全项${items.length > 50 ? '（只显示前 50）' : ''}:`].concat(lines).join('\n')
+      }
+
+      default:
+        return `未知操作: ${input.operation}`
+    }
+  }
+}

@@ -2,8 +2,9 @@
  * CLI / Web 共用：工具注册 + 系统提示拼装
  * Web 壳必须走这里，避免和 CLI 两套行为。
  */
-import { ToolRegistry } from '../tools/tools.mjs'
-import { FileReadTool, FileWriteTool, FileEditTool, MultiEditTool } from '../tools/file-tools.mjs'
+import { ToolRegistry, applyDeferredTools } from '../tools/tools.mjs'
+import { ToolSearchTool } from '../tools/tools-toolsearch.mjs'
+import { FileReadTool, FileWriteTool, FileEditTool, MultiEditTool, NotebookEditTool } from '../tools/file-tools.mjs'
 import { GlobTool, GrepTool, CodeSearchTool } from '../tools/search-tools.mjs'
 import { PTYBashTool } from './pty.mjs'
 import { BashOutputTool, KillShellTool } from '../agent/bg-bash.mjs'
@@ -18,11 +19,14 @@ import {
 import { MemoryTool, UserInputHistoryTool, InputHistory } from '../agent/agent-tools.mjs'
 import { CommandExecTool } from '../agent/agent-tools.mjs'
 import { EnterWatchTool, ExitWatchTool } from '../agent/plan.mjs'
+import { EnterWorktreeTool, ExitWorktreeTool } from '../tools/tools-worktree.mjs'
 import { DshPluginTool } from '../tools/tools-dsh-plugin.mjs'
 import { TavilySearchTool } from '../tools/tavily.mjs'
 import { termuxTools } from '../phone/termux-tools.mjs'
 import { HashlineReadTool, HashlineEditTool, HashlineGrepTool } from '../tools/tools-hashline.mjs'
 import { ApplyPatchTool, TestTool, DiagnosticsTool, RepoMapTool, SymbolsTool, SafeRenameTool, SleepTool } from '../tools/tools-smart.mjs'
+import { LspTool } from '../tools/lsp.mjs'
+import { MonitorTool } from '../tools/tools-monitor.mjs'
 import { ViewImageTool, ViewVideoTool, ScreencapTool } from '../tools/tools-vision.mjs'
 import { ImageGenTool } from '../tools/tools-imagegen.mjs'
 // 【Web 与 CLI 工具对齐】这五组工具以前只在 index.mjs（CLI 路径）注册，
@@ -42,10 +46,11 @@ import { FindImageTool } from '../tools/tools-image-search.mjs'
 import { SearchInfoTool, LookupTool } from '../tools/tools-lookup.mjs'
 // 子 Agent 管控（2026-09-19 补）：Web 早就能 spawn 子 Agent（Agent 工具在），
 // 但拿不到状态/中止/输出/记忆 —— 长任务一旦派出去就失去控制，只能干等或杀掉整个服务。
-import { AgentStatusTool, AgentStopTool, AgentOutputTool } from '../tools/tools-agent-status.mjs'
+import { AgentStatusTool, AgentStopTool, AgentOutputTool, ListAgentsTool } from '../tools/tools-agent-status.mjs'
+import { SESSION_TOOLS } from '../tools/tools-sessions.mjs'
 import { AgentMemoryTool } from '../tools/tools-agent-memory.mjs'
 import { ClaudeMdLoader } from '../session/persistence.mjs'
-import { SYSTEM_PROMPT, SESSION_START_PROMPT, envPaths } from './prompts.mjs'
+import { SYSTEM_PROMPT, SESSION_START_PROMPT, interpolateEnvPrompt } from './prompts.mjs'
 import { CustomCommandLoader, ensureCommandsDir } from '../commands/custom-commands.mjs'
 import { CustomAgentLoader, ensureAgentsDir } from '../agent/custom-agents.mjs'
 import { registerBuiltinPlugin } from '../integrations/plugins.mjs'
@@ -110,6 +115,8 @@ export function createEngineToolkit(opts = {}) {
   registry.register(new FileWriteTool(multiUndo))
   registry.register(new FileEditTool(multiUndo))
   registry.register(new MultiEditTool(multiUndo))
+  // NotebookEdit：.ipynb 单元格编辑（对齐官方 2.1.303），依赖 Read 的 cell 视图
+  registry.register(new NotebookEditTool(multiUndo))
   registry.register(new PTYBashTool())
   registry.register(new BashOutputTool())
   registry.register(new KillShellTool())
@@ -136,6 +143,9 @@ export function createEngineToolkit(opts = {}) {
   registry.register(new ApplyPatchTool(multiUndo))
   registry.register(new TestTool())
   registry.register(new DiagnosticsTool())
+  registry.register(new LspTool())
+  // Monitor：后台命令输出推式通知（官方同名工具对齐）
+  registry.register(new MonitorTool())
   registry.register(new RepoMapTool())
   registry.register(new SymbolsTool())
   registry.register(new SafeRenameTool(multiUndo))
@@ -161,6 +171,12 @@ export function createEngineToolkit(opts = {}) {
   registry.register(new AgentStatusTool())
   registry.register(new AgentStopTool())
   registry.register(new AgentOutputTool())
+  // ListAgents 之前在 Web 端漏注册了 —— SendMessage 的 to 能填三种东西
+  //（子 Agent 名 / 团队成员 / 广播），但 Web 里没有任何工具能列出「有哪些名字可用」，
+  // 只能瞎猜，猜错就白跑一轮。CLI 侧 index.mjs 一直有，这里补齐。
+  registry.register(new ListAgentsTool())
+  // 跨会话（Web ↔ CLI）：ListSessions / SendMessagePeer / ReleaseHeldMessages
+  for (const t of SESSION_TOOLS) registry.register(t)
   registry.register(new AgentMemoryTool({ getAgentType: () => 'main' }))
   registry.register(new FindImageTool())
   registry.register(new SearchInfoTool())
@@ -199,6 +215,14 @@ export function createEngineToolkit(opts = {}) {
     registry.register(new ExitWatchTool(() => opts.watchModeSetter(false)))
   }
 
+  // worktree 会话切换（对齐官方 2.1.303）。
+  // 切的是**当前 Agent 实例的 cwd**：liveAgent 由 attachAgent 注入，
+  // 每次工具调用都现取，所以 agent 换实例（新会话）后自动跟着走。
+  const wtGetCwd = () => liveAgent?.cwd || cwd
+  const wtSetCwd = (p) => { if (liveAgent) liveAgent.cwd = p }
+  registry.register(new EnterWorktreeTool({ getCwd: wtGetCwd, setCwd: wtSetCwd }))
+  registry.register(new ExitWorktreeTool({ getCwd: wtGetCwd, setCwd: wtSetCwd }))
+
   // CommandExec：跑程序内 slash 命令。CLI 在 index.mjs 传 handleCommand 注册；
   // Web 传自己的 executeSlashCommand 包装（避免两套命令实现漂移）。
   if (typeof opts.commandExecHandler === 'function') {
@@ -222,6 +246,10 @@ export function createEngineToolkit(opts = {}) {
       getSubagentTypes: () => customAgents.mergeInto(BUILTIN_SUBAGENT_TYPES),
       cwd,
       sessionId: opts.sessionId || null,
+      // 同 index.mjs：子 Agent 继承 hooks，否则 hooks.json 里的 PreToolUse
+      // 规则对子 Agent 不生效（权限漏洞），也拿不到 SubagentStart/Stop 事件。
+      // opts 里没给就保持 null —— Web 等其它入口的行为不变。
+      hookManager: opts.hookManager || null,
     })
     registry.register(subAgentTool)
 
@@ -247,6 +275,17 @@ export function createEngineToolkit(opts = {}) {
     }
   }
 
+  // ── ToolSearch 延迟加载 ────────────────────────────────────────────────
+  //
+  // 111 个工具的 schema 每轮全量发给 API 是最大的单项上下文开销。低频工具标
+  // shouldDefer 后只输出占位（name + 一句话），模型要用时经 ToolSearch 取回完整说明。
+  //
+  // 【为什么放在所有 register 之后】MCP / extraTools 是运行时注册的，必须等它们
+  // 都进了 registry 再判定，否则晚到的工具永远不会被标记。
+  // 【为什么 ToolSearch 自己不延迟】它必须常驻 —— 模型每轮都可能要检索。
+  applyDeferredTools(registry)
+  registry.register(new ToolSearchTool({ getRegistry: () => registry }))
+
   function getRuntimeModelInfo() {
     const raw = typeof opts.getRuntimeModelInfo === 'function'
       ? opts.getRuntimeModelInfo()
@@ -267,65 +306,14 @@ export function createEngineToolkit(opts = {}) {
   /**
    * 把提示词里的 {{占位符}} 替换成实际值。
    *
-   * 【为什么需要】
-   * 提示词模板里有 {{WORKSPACE}} {{HOME}} 这类占位符，
-   * 但它们从来没被替换过 —— 模型看到的就是字面的 "{{WORKSPACE}}"。
-   * 而且 Termux / CCM 两种环境的路径约定不同，必须动态填。
+   * 【2026-10-20 改为复用】原来的 map（HOME/ENV_NOTE/ENV_LABEL/KEEPALIVE_NOTE/
+   * BROWSER_TOOLS_SECTION）只存在于这里，导致 CLI 路径完全不插值、5 个占位符
+   * 原样泄漏给模型。现在这份逻辑搬到了 `prompts.mjs` 的 `interpolateEnvPrompt()`，
+   * CLI（走 fillPromptVars）与 Web（走这里）共用同一份，不会再各自漂移。
+   * 这里保留成薄封装，是因为调用点还有一处差异：Web 的 WORKSPACE 用启动时 cwd。
    */
   function interpolatePrompt(text) {
-    const p = envPaths()
-    const envNote = p.env === 'ccm'
-      ? `你运行在 **CCM 原生外壳**里（App 内嵌的 proot Ubuntu），不是 Termux。\n` +
-        `- 外部存储：\`${p.external}\`（App 专属目录）${p.sdcardNote}\n` +
-        `- ${p.phoneNote}\n` +
-        `- 用户的 \`/sdcard\` 只有在 App 里授权后才可见。`
-      : `你运行在 **Termux** 里。\n` +
-        `- 家目录：\`${p.home}\`\n` +
-        `- 外部存储：\`${p.external}\`\n` +
-        `- ${p.phoneNote}`
-    const envLabel = p.env === 'ccm' ? 'CCM 原生外壳（proot Ubuntu）' : 'Termux 环境'
-
-    // ⚠️ 只替换**白名单**里的占位符，不要用正则扫全部 {{...}}。
-    //
-    // 【为什么】提示词里还有别的 {{}} 用法：
-    //   · 用户内容里的 {{...}}（如 Agent 写进提示词模板的占位符）—— 那是给
-    //     前端/下游渲染的，服务端**绝不能碰**
-    //   · sessionStartPrompt 里的 {{DATE}} {{CWD}} —— 由调用方单独处理
-    // 用白名单能保证不误伤。
-    // 【平台相关的工具清单】
-    //
-    // prompts.mjs 是**单份通用提示词**，但有些工具只在特定环境存在：
-    //   · playwright 的 browser_* —— 需要 X11 + Chromium。
-    //     Termux 里通过 MCP 提供；CCM（APK）的 mcp.json 里没配它
-    //     （注释写明「依赖 X11/Chromium，在 CCM 里不适用」）。
-    //
-    // 不裁剪的后果：AI 看到提示词里列了 browser_navigate，会以为能用，
-    // 尝试调用 → 报「工具不存在」→ 用户困惑「不是说支持吗」。
-    // 这类错误很隐蔽：模型会归因成自己用错了参数，反复重试。
-    const browserTools = p.env === 'ccm'
-      ? `### 浏览器自动化工具
-本环境（CCM 原生外壳）**没有** playwright 的 browser_* 工具 —— 它们依赖 X11 + Chromium，
-而 proot Ubuntu 里跑不了。需要看网页时用 \`WebFetch\` 工具（抓取内容），
-需要真实浏览器交互则要先切到 Termux 环境。
-（提示词里不再列具体工具名，免得模型以为能调）`
-      : `### 浏览器自动化工具（playwright）
-- browser_navigate, browser_click, browser_type, browser_snapshot, browser_evaluate
-- browser_network_requests, browser_network_request, browser_console_messages
-- browser_navigate_back, browser_fill_form, browser_select_option, browser_drag, browser_hover`
-
-    const map = {
-      '{{WORKSPACE}}': cwd || p.workspace,
-      '{{HOME}}': p.home,
-      '{{ENV_NOTE}}': envNote,
-      '{{ENV_LABEL}}': envLabel,
-      '{{KEEPALIVE_NOTE}}': p.keepaliveNote,
-      '{{BROWSER_TOOLS_SECTION}}': browserTools,
-    }
-    let out = text
-    for (const [k, v] of Object.entries(map)) {
-      out = out.split(k).join(v)   // split/join 避免 replace 的 $ 特殊处理
-    }
-    return out
+    return interpolateEnvPrompt(text, cwd)
   }
 
   function getSystemPrompt() {

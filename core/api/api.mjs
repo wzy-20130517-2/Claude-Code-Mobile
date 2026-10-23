@@ -501,6 +501,57 @@ export class ApiClient {
   }
 
   /**
+   * 克隆一份 client，只覆盖指定字段（目前用于给子 Agent 指定不同模型）。
+   *
+   * 【为什么不用 Object.create(this)】原型链继承会让**后续对父对象的修改穿透到子对象**：
+   * 父 api 在切 provider 时改 `this.model` / `this.baseUrl`，已经派出去的子 Agent
+   * 会突然跟着换模型（它的请求在跑到一半时换了后端，症状是莫名其妙的 400）。
+   * 这里做成真正的独立实例：字段值复制一份，能力探测结论和 key 池显式共享。
+   *
+   * 【哪些必须共享、哪些必须隔离】
+   *   共享：keyPool（同一个 provider 的 key 轮换状态必须一致，否则两套池各转各的，
+   *         一个 key 挂了另一边还在拿它重试）、_thinkingFallbackKeys 等**端点级**能力
+   *         结论（那是「这个端点不支持思考参数」的实测事实，跟谁在问无关）。
+   *   隔离：model / baseUrl / protocol / 会话态（_lastResponseId、sessionCacheKey）——
+   *         子 Agent 是独立对话，复用主对话的 previous_response_id 会把两段不相干的
+   *         历史在服务端接在一起（上下文串台）。
+   */
+  clone({ model, baseUrl, protocol, temperature, maxOutputTokens, thinkingConfig, noTools, systemTopLevel } = {}) {
+    const next = new ApiClient({
+      baseUrl: baseUrl ?? this.baseUrl,
+      apiKey: this._fallbackKey,
+      model: model ?? this.model,
+      protocol: protocol ?? this.protocol,
+      fetch: this.fetch,
+      timeout: this.timeout,
+      maxRetries: this.maxRetries,
+      streamTimeout: this.streamTimeout,
+      thinkingConfig: thinkingConfig !== undefined ? thinkingConfig : this.thinkingConfig,
+      temperature: temperature !== undefined ? temperature : this.temperature,
+      maxOutputTokens: maxOutputTokens !== undefined ? maxOutputTokens : this.maxOutputTokens,
+      noTools: noTools !== undefined ? noTools : this.noTools,
+      systemTopLevel: systemTopLevel !== undefined ? systemTopLevel : this.systemTopLevel,
+      replayReasoning: this.replayReasoning,
+      promptCacheRetention: this.promptCacheRetention,
+      promptCacheEnabled: this.promptCacheEnabled,
+    })
+    // 共享 key 池：用同一个对象引用，不是复制。
+    // 复制会让「某个 key 额度耗尽」这个结论只在一边生效 —— 子 Agent 会继续
+    // 拿一个已知失效的 key 重试，表现为「主对话正常、子 Agent 全 401」。
+    next.keyPool = this.keyPool
+    next._fallbackKey = this._fallbackKey
+    // 端点级能力探测结论共享（同一个端点 = 同一批事实）
+    next._thinkingFallbackKeys = this._thinkingFallbackKeys
+    next._visionDisabledKeys = this._visionDisabledKeys
+    next._reasoningHistoryDisabledKeys = this._reasoningHistoryDisabledKeys
+    next._incrementalKeys = this._incrementalKeys
+    next._imageUrlStyles = this._imageUrlStyles
+    // 连接层可疑窗口共享（同一个进程的 fetch 连接池，坏连接是全局的）
+    next._connectionSuspectAt = this._connectionSuspectAt
+    return next
+  }
+
+  /**
    * 主动把当前 key 标记为失效并换下一个。供 agent 层在 401/403 重试前调用。
    *
    * 为什么需要这个包装：request() 内部只在自己那一层的 while 里轮换，
@@ -651,9 +702,21 @@ export class ApiClient {
     // 按次覆盖（如 compact 摘要固定 medium）：只换档位，不改变开关 ——
     // thinkingConfig.enabled=false 时依旧整体关闭，开关归用户。
     const VALID_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+    // 【auto 档】enabled=true 但没设 effort = auto：不发送 effort，由服务端/模型
+    // 用自己的默认档位。官方 /effort auto 的语义正是「删掉显式档位」而不是挑一个
+    // 具体值（chunk-6jwsqnf1.js 的 fn32341 返回 {value: undefined}，fn8816 同款）。
+    //
+    // 【为什么原来不行】这里缺 effort 时兜底成 'high'，于是 auto 永远发 high，
+    // 与显式设 high 完全一样 —— 那是个名不副实的档位。改成 null 后，
+    // 两个发送点（body.reasoning_effort / body.reasoning）的
+    // `&& thinkingPolicy.effective` 判断自然跳过，请求里就不带这个字段。
+    //
+    // 注意 anthropic 原生协议不受影响：那边走 budget_tokens = max_tokens - 1，
+    // 本来就不看 effort（见下方分支），auto 与具体档位行为相同。
+    const hasExplicitEffort = VALID_EFFORTS.includes(this.thinkingConfig?.effort)
     const requested = VALID_EFFORTS.includes(overrideEffort)
       ? overrideEffort
-      : (VALID_EFFORTS.includes(this.thinkingConfig?.effort) ? this.thinkingConfig.effort : 'high')
+      : (hasExplicitEffort ? this.thinkingConfig.effort : null)
     const model = String(this.model || '').toLowerCase()
     const configured = this.thinkingConfig?.enabled === true
     const gatewayFallback = configured && this._thinkingFallbackKeys.has(this._thinkingCompatKey())
@@ -709,6 +772,9 @@ export class ApiClient {
         ? `当前模型 ${this.model} 未识别为兼容思考参数，已安全省略`
         : '不发送思考参数'
     if (p.kind === 'reasoning_effort') {
+      // auto 档（enabled 但没设 effort）不发 reasoning_effort 字段，
+      // 直接说清楚，别显示成 reasoning_effort=null。
+      if (!p.effective) return 'auto（不发送 reasoning_effort，由模型默认档位决定）'
       // Responses 协议发的是 body.reasoning = { effort }（嵌套对象），
       // 显示时标明实际字段名，免得 /config 看到 reasoning_effort 却对不上请求
       return this.protocol === 'responses'

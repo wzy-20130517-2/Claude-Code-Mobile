@@ -44,9 +44,16 @@ export class CustomAgentLoader {
             const parts = meta.tools.split(',').map(s => s.trim()).filter(Boolean)
             if (parts.length) toolNames = parts
           }
+          // disallowed-tools（对齐 Agent 工具的 disallowedTools）：
+          // 角色卡也可以是「白名单 + 少量禁用」的组合写法。没有 tools 时
+          // 它是「全部工具里禁掉几个」，语义与 Agent 工具一致（差集）。
+          const disallowedTools = meta['disallowed-tools']
+            ? meta['disallowed-tools'].split(',').map(s => s.trim()).filter(Boolean)
+            : []
           this.agents.set(name, {
             description: meta.description || `自定义 agent: ${name}`,
             toolNames,
+            disallowedTools,
             maxTurns: Number(meta.maxTurns) || 30,
             promptAddition: `\n# 你的角色：自定义子 Agent (${name})\n${body}\n**重要**：你运行在后台，永远不要调用 AskUserQuestion。\n`,
             source: full,
@@ -63,6 +70,7 @@ export class CustomAgentLoader {
       out[name] = {
         description: cfg.description,
         toolNames: cfg.toolNames,
+        disallowedTools: cfg.disallowedTools || [],
         maxTurns: cfg.maxTurns,
         promptAddition: cfg.promptAddition,
       }

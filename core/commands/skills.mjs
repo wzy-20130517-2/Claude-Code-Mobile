@@ -576,10 +576,29 @@ export class SkillTool extends Tool {
       input_schema: {
         type: 'object',
         properties: {
-          name: { type: 'string', description: 'skill 名（不含 .md），支持模糊匹配' },
+          // ── 官方字段名 skill（对齐 claude.js 的 Skill schema）──────────
+          // 官方用 `skill` 而不是 `name`。模型按训练习惯多半会传 skill，
+          // 老会话/老提示词里是 name。两个都收，skill 优先。
+          skill: { type: 'string', description: 'skill 名（不含 .md），支持模糊匹配' },
+          name: { type: 'string', description: '【兼容旧写法，优先用 skill】skill 名（不含 .md）' },
           args: { type: 'string', description: '可选参数，替换 {{args}} / {{query}}' },
         },
-        required: ['name'],
+        // 注意：required 里**两个都不放**。放 skill 会让只传 name 的老调用
+        // 在校验阶段就被拒（还没走到 coerceInput 归一化）；放 name 则相反。
+        // 由 validateInput 保证「至少有一个」。
+      },
+      validateInput: (input) => {
+        const errors = []
+        const s = input.skill ?? input.name
+        if (!s || !String(s).trim()) errors.push('skill is required（或 name，两者等价）')
+        return { valid: errors.length === 0, errors }
+      },
+      // 把 name 归一化成 skill，后面 execute 只认一个字段
+      coerceInput: (input) => {
+        if (!input || typeof input !== 'object') return null
+        if (input.skill !== undefined && input.skill !== null && input.skill !== '') return null
+        if (input.name === undefined || input.name === null || input.name === '') return null
+        return { ...input, skill: input.name }
       },
     })
     this.loader = loader
@@ -587,11 +606,20 @@ export class SkillTool extends Tool {
     this.forkRunner = opts.forkRunner || null
     // hookManager 同理由 index.mjs 注入，用于注册 skill 自带的 hooks
     this.hookManager = opts.hookManager || null
+    // 展开登记回调（可选）：每次真正展开一个 skill 时调用 onExpand(名字)。
+    // 用途是 /skill-doctor 要看「本会话用过哪些 skill」—— 光靠 loader.list()
+    // 只能知道有哪些，不知道用过哪些。放在这里而不是让调用方自己包一层，
+    // 是因为展开路径有两条（模型调 Skill 工具 / 用户敲 /名字 走 expandActiveSkill），
+    // 分散登记必然漏。
+    this.onExpand = typeof opts.onExpand === 'function' ? opts.onExpand : null
   }
 
   async execute(input) {
-    const entry = this.loader.get(input.name)
-    if (!entry) throw new Error(`Skill "${input.name}" not found（项目 skills/ 与 ~/.claude/skills/）`)
+    // coerceInput 已把 name 归一化成 skill，这里再兜一次底（直接调 execute
+    // 绕过 run() 的路径，如测试或内部复用）。
+    const skillName = input.skill ?? input.name
+    const entry = this.loader.get(skillName)
+    if (!entry) throw new Error(`Skill "${skillName}" not found（项目 skills/ 与 ~/.claude/skills/）`)
 
     // disable-model-invocation：官方唯一的行为开关。声明后只能用户显式 /名字 触发，
     // 模型不许自己调（防止把「需要人拍板」的 skill 自动跑掉）。
@@ -605,6 +633,10 @@ export class SkillTool extends Tool {
     // skill 声明的 hooks 在展开时生效（session 级）。
     // 放在 body 组装之前：万一 registerSkillHooks 抛了也不影响正文返回。
     registerSkillHooksIfAny(this.hookManager, entry)
+
+    // 登记「本会话展开过这个 skill」（/skill-doctor 用）。
+    // 放在 disableModelInvocation 检查之后 —— 被拒绝的调用不算「用过」。
+    try { this.onExpand?.(entry.name) } catch {}
 
     const body = withSkillFiles(applySkillArgs(entry.body || '', input.args), entry)
 

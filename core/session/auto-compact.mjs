@@ -201,11 +201,6 @@ export function getContextWaterLevel(lastPromptTokens) {
   return { level: 'ok', remain }
 }
 
-/** 兼容占位：不再启用 cache-aware 自动摘要，始终返回 false */
-export function setCacheAwareEnabled(v) {
-  return false
-}
-
 // 多档阈值：warning → error → blocking（仅用于状态显示，不驱动自动摘要）
 const MARGIN_AUTOCOMPACT = 13000
 const MARGIN_WARNING = 33000
@@ -232,10 +227,63 @@ export function shouldCompact(messages, tokenUsage, lastPromptTokens) {
   return false
 }
 
-// 断路器：连续 3 次压缩失败则停止
+// 断路器：连续 3 次压缩失败则停止。
+// 【2026-10-20】原来还导出 getConsecutiveFailures / resetFailures 两个 getter，
+// 全项目零调用（`/compact status` 也不读它们）—— 已删。
+// 计数器本身是活的，由 autoCompact 内部维护，别一起删。
 let _consecutiveFailures = 0
-export function getConsecutiveFailures() { return _consecutiveFailures }
-export function resetFailures() { _consecutiveFailures = 0 }
+
+// ══════════════════════════════════════════════════════════════════
+//  rapid-refill 断路器（对齐官方 2.1.303）
+// ══════════════════════════════════════════════════════════════════
+//
+// 【要解决什么】上面那个 _consecutiveFailures 只挡「压缩抛异常」。
+// 还有一种更隐蔽的烧钱方式：压缩**成功**了，但压不下去多少 ——
+// 下一轮上下文立刻又回到阈值以上，于是又压、又超、又压……
+// 每一轮都白跑一次摘要 API 调用，且用户看到的是「一直在压缩」。
+//
+// 官方在 claude.js:864378 用 fn37392 判这个：
+//   fn37382(v) = v?.compacted === true && v.turnCounter < 3
+//                ? (v?.consecutiveRapidRefills ?? 0) + 1 : 0
+//   fn37392 → { action: consecutiveRapidRefills >= 3 ? "trip" : "proceed" }
+// 常量 num2892 = 3（轮窗口）、trip 阈值也是 3。
+//
+// 【为什么不用官方原样的 turnCounter】官方在主循环状态里维护 `turnCounter`
+// （跨轮递增），CCM 的 agent.turnCount 每次 run 都重置，且 autoCompact 的
+// 两个调用点（index.mjs / web/server.mjs）**只在超阈值时才调** ——
+// 没有"每轮 tick 一次"的钩子，硬套轮次窗口只会得到错的数。
+//
+// 【等价判据：这次压缩到底压掉了多少】
+// rapid refill 的本质是「压了等于没压」：压缩后 token 仍贴着阈值，
+// 下一轮马上又超。所以直接量降幅即可，而且**零调用点改动**：
+//   上次压缩前 lastPromptTokens = A
+//   本次进来时  lastPromptTokens = B（= 上次压缩后的真实占用）
+//   B >= A * EFFECTIVE_DROP_RATIO → 上次压缩无效 → 计数 +1
+//   B <  A * EFFECTIVE_DROP_RATIO → 压缩有效     → 计数清零
+// 这与官方「压缩后 <3 轮又超」抓的是同一批坏情况：
+// 压不动 → 下一轮必超 → 连续命中。
+//
+// 【为什么不用时间窗口】官方用轮次不用时间 —— 慢速对话里「1 小时后又超」
+// 是正常的，快速循环里「30 秒后又超」才是 thrashing。
+const RAPID_REFILL_TRIP_THRESHOLD = 3 // 官方 fn37392 的 >= 3
+// 降幅不足 10% 视为「没压下去」。取 10% 是因为：真正有效的压缩
+// （摘要/丢工具输出）通常能砍掉 30%+；而阈值附近的抖动、新增长的一条消息
+// 都远小于 10%。设太高会把「压了 8% 但确实够了」误判成 thrashing。
+const EFFECTIVE_DROP_RATIO = 0.9
+let _consecutiveRapidRefills = 0
+let _lastPreCompactTokens = 0   // 上次压缩前的占用
+let _tripped = false
+
+// 【2026-10-20】原来这里导出 getRapidRefillState()（注释写"供 /compact status
+// 与诊断使用"），但 /compact status 用的是 compactService.analyze，全项目零调用 —— 已删。
+// 三个状态变量本身是活的（autoCompact 里读写），别一起删。
+
+/** 用户手动 /compact 后调用：手动压缩是明确意图，清掉熔断状态重新开始 */
+export function resetRapidRefill() {
+  _consecutiveRapidRefills = 0
+  _lastPreCompactTokens = 0
+  _tripped = false
+}
 
 export async function autoCompact(agent, compactService, { print = console.log } = {}) {
   const history = agent.getHistory()
@@ -254,8 +302,79 @@ export async function autoCompact(agent, compactService, { print = console.log }
     return false
   }
 
+  // ── rapid-refill 断路器（对齐官方 fn37392）────────────────────────
+  // 判定上次压缩是否「白压」：本次进来的占用 vs 上次压缩前的占用。
+  // 只有真做过一次压缩（_lastPreCompactTokens > 0）才有可比基线。
+  if (_lastPreCompactTokens > 0) {
+    const nowTokens = agent.getLastPromptTokens?.() || 0
+    if (nowTokens > 0 && nowTokens >= _lastPreCompactTokens * EFFECTIVE_DROP_RATIO) {
+      _consecutiveRapidRefills++
+    } else {
+      // 上次压缩确实压下去了 → 不是 thrashing，计数清零重新观察
+      _consecutiveRapidRefills = 0
+    }
+  }
+  // 【熔断后怎么自愈】不靠外部调用 resetRapidRefill（那要改 /compact 命令层，
+  // 属于别人的地盘）。判据放在这里更自然：熔断状态下如果占用**已经明显低于**
+  // 上次压缩前的基线，说明用户手动 /compact 过了（它会 setApproxPromptTokens
+  // 重估占用），此时自动解除熔断重新观察。
+  // 不这么做的话，熔断一旦触发就只能 Ctrl+X 重启 —— 用户会以为功能坏了。
+  if (_tripped && _lastPreCompactTokens > 0) {
+    const nowT = agent.getLastPromptTokens?.() || 0
+    if (nowT > 0 && nowT < _lastPreCompactTokens * EFFECTIVE_DROP_RATIO) {
+      _tripped = false
+      _consecutiveRapidRefills = 0
+      _lastPreCompactTokens = 0
+    }
+  }
+  if (_consecutiveRapidRefills >= RAPID_REFILL_TRIP_THRESHOLD) {
+    // 只报一次，之后静默 —— 否则每轮都刷一行，用户以为程序坏了
+    if (!_tripped) {
+      _tripped = true
+      announce(`\n\x1b[2m[自动压缩已熔断: 连续 ${RAPID_REFILL_TRIP_THRESHOLD} 次压缩后占用没降下来（压缩没有实际收益），本次会话不再自动压缩。用 /compact 手动压缩可重置。]\x1b[0m`)
+    }
+    return false
+  }
+
   const before = history.length
   try {
+    // ══════════════════════════════════════════════════════════════════
+    //  先跑 micro（零 API、无损），压得下来就不调摘要
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // 【2026-10-20 修】下面这段 force 的注释一直写着「不影响压缩策略选择
+    // （micro/摘要）」，但**代码里从来没有 micro 这一步** —— 自动压缩直接进摘要。
+    // 手动 /compact 是有的（cmd-compact.mjs:93 先 microCompact 再摘要），
+    // 两条路径行为不一致：长会话每次都白白多花一次摘要 API 调用，
+    // 而其中大半体积只是可重跑的工具输出（Read/Grep/Bash 结果）。
+    //
+    // micro 只截断「可再生」的工具输出，对话本体一字不动，零信息损失。
+    // 压完若压力已回到安全线（与手动 /compact 同口径取 70%），就此收手。
+    let microNote = ''
+    let microResult = null
+    try {
+      microResult = compactService.microCompact(agent.getHistory())
+      if (microResult?.changed > 0) {
+        agent.setHistory(microResult.messages)
+        microNote = `已回收 ${microResult.changed} 条工具输出（~${microResult.reclaimedTokens} tokens，无损）`
+        // 用微压缩后的历史重新评估：下面摘要若不需要了就走人
+        const afterMicro = compactService.analyze(agent.getHistory(), {
+          lastPromptTokens,
+          maxContextTokens: maxContext,
+          policy: getCachePolicy(),
+          keepLast: getKeepLast(),
+          force: true,
+        })
+        if ((afterMicro.pressure || 0) < 0.70) {
+          announce(`\n\x1b[2m[自动压缩: ${microNote}，压力降至 ${((afterMicro.pressure || 0) * 100).toFixed(1)}%，无需摘要]\x1b[0m`)
+          return true
+        }
+      }
+    } catch (e) {
+      // micro 是纯本地字符串裁剪，失败不应阻断后面的摘要路径
+      microNote = ''
+    }
+
     // ══════════════════════════════════════════════════════════════════
     //  【2026-10-06 修】force: true —— 否则两层判据打架
     // ══════════════════════════════════════════════════════════════════
@@ -272,19 +391,30 @@ export async function autoCompact(agent, compactService, { print = console.log }
     //
     // force 只跳过「够不够格」的判断，不影响压缩策略选择（micro/摘要）
     // 和 keepLast 等参数。
-    const result = await compactService.compact(history, {
+    const result = await compactService.compact(agent.getHistory(), {
       lastPromptTokens,
       maxContextTokens: maxContext,
       policy: getCachePolicy(),
       keepLast: getKeepLast(),
       force: true,
     })
-    if (!result.compacted) return false
+    if (!result.compacted) {
+      // 摘要这一步没做成（比如 analyze 判定 defer），但 micro 已经生效过
+      if (microNote) {
+        announce(`\n\x1b[2m[自动压缩: ${microNote}]\x1b[0m`)
+        return true
+      }
+      return false
+    }
+    // 备份的是**压缩前**的完整历史（micro 之前的 `history`），
+    // 否则回收站里的副本已经是裁剪过的，想找回原始工具输出就晚了。
     backupBeforeCompact(history, { reason: 'auto', meta: { before: history.length, after: result.messages.length } })
     agent.setHistory(result.messages)
     _consecutiveFailures = 0
+    // 记下本次压缩前的占用，作为「下次进来时判断有没有压下去」的基线
+    _lastPreCompactTokens = lastPromptTokens
     const level = getCompactLevel(lastPromptTokens)
-    announce(`\n\x1b[2m[自动压缩: ${before} → ${result.messages.length} 条消息 (${result.strategy}, ${level})]\x1b[0m`)
+    announce(`\n\x1b[2m[自动压缩: ${before} → ${result.messages.length} 条消息 (${result.strategy}, ${level})${microNote ? `；${microNote}` : ''}]\x1b[0m`)
     return true
   } catch (e) {
     _consecutiveFailures++

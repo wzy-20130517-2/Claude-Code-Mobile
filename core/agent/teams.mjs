@@ -104,7 +104,7 @@ export function setMemberStatus(team, agent, status) {
  * 投递消息到对方 inbox。
  * summary 是给人看的一行预览（官方用于 UI 折叠显示），text 是完整内容。
  */
-export function sendMessage(team, { from, to, text, summary = '', type = 'text' }) {
+export function sendMessage(team, { from, to, text, summary = '', type = 'text', notifyWhenIdle = false }) {
   const cfg = getTeam(team)
   if (!cfg) return { ok: false, reason: 'no_team' }
 
@@ -118,7 +118,7 @@ export function sendMessage(team, { from, to, text, summary = '', type = 'text' 
     if (!targets.length) return { ok: false, reason: 'no_peers' }
     let n = 0
     for (const m of targets) {
-      const r = sendMessage(team, { from, to: m.name, text, summary, type })
+      const r = sendMessage(team, { from, to: m.name, text, summary, type, notifyWhenIdle })
       if (r.ok) n++
     }
     return { ok: true, broadcast: true, delivered: n, targets: targets.map(m => m.name) }
@@ -130,7 +130,9 @@ export function sendMessage(team, { from, to, text, summary = '', type = 'text' 
   }
   mkdirSync(inboxDir(team), { recursive: true })
   const box = readJson(inboxPath(team, target), [])
+  const msgId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
   box.push({
+    id: msgId,
     from: safeName(from),
     to: target,
     type,
@@ -138,12 +140,131 @@ export function sendMessage(team, { from, to, text, summary = '', type = 'text' 
     summary: String(summary || '').slice(0, 80),
     timestamp: new Date().toISOString(),
     read: false,
+    // 消息体上这个标记只用于 CheckMessages 显示「这条带了空闲通知请求」。
+    // 真正的订阅在下面的订阅表里 —— 原来只写这个标记、全仓库没人读，
+    // 等于参数完全没生效（见 subscribeIdle 的注释）。
+    notifyWhenIdle: !!notifyWhenIdle,
   })
   // 超限丢最旧
   const trimmed = box.length > MAX_INBOX_MESSAGES ? box.slice(-MAX_INBOX_MESSAGES) : box
   atomicWrite(inboxPath(team, target), JSON.stringify(trimmed, null, 2))
-  return { ok: true, queued: trimmed.length }
+
+  // 【真正的订阅登记】notify_when_idle 的实现。
+  //
+  // 订阅和消息是两条独立通道（官方也是分开的：Class1363.outstanding 是订阅表，
+  // inbox 是消息）。因为订阅可以「不带消息」—— 单纯想知道某人什么时候空下来。
+  // 所以单独登记，读消息时不会把它消耗掉。
+  if (notifyWhenIdle) {
+    subscribeIdle({ team, watcher: safeName(from), target, msgId })
+  }
+
+  return { ok: true, queued: trimmed.length, msgId }
 }
+
+// ── notify_when_idle 订阅表 ─────────────────────────────────────────
+//
+// 上限抄官方（claude.js:1019579 的 num2439 / num3327 / num1708）：
+//   · 总订阅数 32
+//   · 同一目标最多 3 条（再多说明在刷订阅，没有意义）
+//   · 12 小时过期（等待方如果一直 sleep 会永远等不到，必须有过期兜底）
+const MAX_SUBSCRIPTIONS = 32
+const MAX_PER_TARGET = 3
+const SUBSCRIPTION_TTL_MS = 12 * 60 * 60 * 1000
+
+/** watcher → Map<targetKey, [{msgId, team, target, at, expiresAt}]> */
+const idleSubscriptions = new Map()
+
+function subKey(team, target) { return `${team}::${target}` }
+
+/**
+ * 登记一条「等 target 空闲」的订阅。幂等去重按 msgId（重试场景）。
+ */
+export function subscribeIdle({ team, watcher, target, msgId = null }) {
+  const key = subKey(team, target)
+  const list = idleSubscriptions.get(watcher) || new Map()
+  const arr = list.get(key) || []
+
+  if (msgId && arr.some(s => s.msgId === msgId)) {
+    return { ok: true, deduped: true, count: arr.length }
+  }
+  // 每目标上限：挤掉最旧的一条（官方：「a newer subscription displaced this one」）
+  while (arr.length >= MAX_PER_TARGET) arr.shift()
+
+  // 总量上限：挤掉全局最旧的一条
+  let total = 0
+  for (const a of idleSubscriptions.values()) for (const v of a.values()) total += v.length
+  if (total >= MAX_SUBSCRIPTIONS) {
+    let oldest = null
+    for (const [w, m] of idleSubscriptions) {
+      for (const [k, v] of m) {
+        for (const s of v) {
+          if (!oldest || s.at < oldest.at) oldest = { w, k, s }
+        }
+      }
+    }
+    if (oldest) {
+      const l = idleSubscriptions.get(oldest.w)?.get(oldest.k)
+      if (l) {
+        const i = l.indexOf(oldest.s)
+        if (i >= 0) l.splice(i, 1)
+      }
+    }
+  }
+
+  arr.push({
+    msgId,
+    team,
+    target,
+    watcher,
+    at: new Date().toISOString(),
+    expiresAt: Date.now() + SUBSCRIPTION_TTL_MS,
+  })
+  list.set(key, arr)
+  idleSubscriptions.set(watcher, list)
+  return { ok: true, count: arr.length }
+}
+
+/**
+ * 某个 agent 空闲了 → 取出所有等它的订阅（一次性，取走即删）。
+ *
+ * 调用点：agent 一轮跑完后（agent.mjs 的 _notifyIdleSubscribers）。
+ * 官方的 notify_when_idle 也是一次性的，不是持续监听。
+ */
+export function takeIdleSubscriptions(team, agentName) {
+  const target = safeName(agentName)
+  const key = subKey(team, target)
+  const out = []
+  const now = Date.now()
+  for (const [watcher, list] of idleSubscriptions) {
+    const arr = list.get(key)
+    if (!arr || !arr.length) continue
+    for (const s of arr) {
+      if (s.expiresAt <= now) continue   // 过期静默丢弃
+      out.push({ watcher, team, target, msgId: s.msgId })
+    }
+    list.delete(key)
+    if (!list.size) idleSubscriptions.delete(watcher)
+  }
+  return out
+}
+
+/** 查看当前订阅表（「谁在等谁」），给 ListAgents / /team 展示。 */
+export function listIdleSubscriptions() {
+  const out = []
+  const now = Date.now()
+  for (const [watcher, list] of idleSubscriptions) {
+    for (const arr of list.values()) {
+      for (const s of arr) {
+        if (s.expiresAt <= now) continue
+        out.push({ ...s, watcher, expiresIn: Math.round((s.expiresAt - now) / 60000) })
+      }
+    }
+  }
+  return out
+}
+
+/** 清空订阅表（测试 / 会话重置用）。 */
+export function clearIdleSubscriptions() { idleSubscriptions.clear() }
 
 /**
  * 读取 inbox。默认只返回未读并标记已读（drain 语义），

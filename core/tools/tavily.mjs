@@ -63,6 +63,29 @@ export class TavilySearchTool extends Tool {
           include_answer: { type: 'boolean', description: '是否包含 AI 生成的摘要答案，默认 true。注意：摘要经常把不相关的事实缝在一起，只能当线索，不要直接当答案' },
           include_domains: { type: 'array', items: { type: 'string' }, description: '只在这些域名内搜索（如 ["github.com","stackoverflow.com"]），查技术问题时很有效' },
           exclude_domains: { type: 'array', items: { type: 'string' }, description: '排除这些域名（如排除 CSDN 之类的低质量转载站）' },
+          // ── 对齐官方 Claude Code 2.1.303 的 mode ──
+          // 官方语义：standard = 快而省，extended = 全面且新鲜但贵几倍。
+          // CCM 底层是 Tavily，没有「一次调用搜多轮」的概念，能对上的就是
+          // search_depth（basic/advanced）。所以 mode 做成它的同义别名：
+          //   mode=standard → search_depth=basic
+          //   mode=extended → search_depth=advanced
+          // 两者都给时 mode 优先（它更接近官方的措辞，跨端 prompt 会带它）。
+          //
+          // ⚠ 默认值与官方不同：官方默认 extended，CCM 默认 standard（basic）。
+          // 原因：Tavily 的 advanced 实测慢 2~3 倍，而 CCM 的搜索调用里
+          // 大多数是「查一下这个报错」这种一次就够的场景，默认拉满等于每次
+          // 都多花钱多等。要更全就显式传 mode:'extended'。
+          mode: {
+            type: 'string',
+            enum: ['standard', 'extended'],
+            description: '搜索强度（官方同名字段）。standard=快而省（默认，等同 search_depth:basic）；extended=更全更新但慢 2~3 倍（等同 search_depth:advanced）。仅在 standard 结果太薄/跑偏/可能过时时才用 extended。',
+          },
+          // ── 官方字段名的别名 ──
+          // 官方 WebSearch 叫 allowed_domains / blocked_domains，CCM 早期跟着
+          // Tavily 叫 include_domains / exclude_domains。两套都收，避免
+          // 「按官方写法传了却被静默忽略」——那种失败不报错，只是范围没生效。
+          allowed_domains: { type: 'array', items: { type: 'string' }, description: '（官方同名字段，等价于 include_domains）只在这些域名内搜索' },
+          blocked_domains: { type: 'array', items: { type: 'string' }, description: '（官方同名字段，等价于 exclude_domains）不包含这些域名的结果' },
           days: { type: 'number', description: '只要最近 N 天的内容（查时效性话题用，如版本更新、近期事件）' },
         },
         required: ['query'],
@@ -74,6 +97,7 @@ export class TavilySearchTool extends Tool {
         const errors = []
         if (!input.query) errors.push('query is required')
         if (input.max_results && (input.max_results < 1 || input.max_results > 10)) errors.push('max_results must be 1-10')
+        if (input.mode !== undefined && !['standard', 'extended'].includes(input.mode)) errors.push('mode 只能是 standard 或 extended')
         return { valid: errors.length === 0, errors }
       },
     })
@@ -82,11 +106,18 @@ export class TavilySearchTool extends Tool {
   async execute(input) {
     const apiKey = getTavilyKey()
     if (!apiKey) throw new Error('Tavily API key 未配置：请设置环境变量 TAVILY_API_KEY 或 config.json 的 tavilyKey 字段')
+    // mode（官方字段）优先于 search_depth（Tavily 原生字段）：
+    // 跨端 prompt 里带的是 mode，它代表调用方的真实意图，不该被另一个别名覆盖。
+    const depth = input.mode === 'extended'
+      ? 'advanced'
+      : input.mode === 'standard'
+        ? 'basic'
+        : (input.search_depth === 'advanced' ? 'advanced' : 'basic')
     const body = {
       api_key: apiKey,
       query: input.query,
       max_results: Math.min(10, Math.max(1, input.max_results || 5)),
-      search_depth: input.search_depth === 'advanced' ? 'advanced' : 'basic',
+      search_depth: depth,
       include_answer: input.include_answer !== false,
       include_raw_content: false,
       // chunks_per_source：每个来源取几段内容。实测（2026-09-04 对照实验）
@@ -96,12 +127,18 @@ export class TavilySearchTool extends Tool {
     }
     // 域名定向/排除：查技术问题时把范围收进 github/stackoverflow/官方文档
     // 比调任何「深度」参数都有效（Tavily 的强项就是英文技术内容）。
-    if (Array.isArray(input.include_domains) && input.include_domains.length) {
-      body.include_domains = input.include_domains.slice(0, 20)
-    }
-    if (Array.isArray(input.exclude_domains) && input.exclude_domains.length) {
-      body.exclude_domains = input.exclude_domains.slice(0, 20)
-    }
+    // 官方字段名（allowed_/blocked_domains）与 Tavily 原生名（include_/exclude_domains）
+    // 都收，合并成一个列表 —— 调用方按哪套写都该生效。
+    const includeDomains = [
+      ...(Array.isArray(input.include_domains) ? input.include_domains : []),
+      ...(Array.isArray(input.allowed_domains) ? input.allowed_domains : []),
+    ].filter(d => typeof d === 'string' && d.trim())
+    const excludeDomains = [
+      ...(Array.isArray(input.exclude_domains) ? input.exclude_domains : []),
+      ...(Array.isArray(input.blocked_domains) ? input.blocked_domains : []),
+    ].filter(d => typeof d === 'string' && d.trim())
+    if (includeDomains.length) body.include_domains = includeDomains.slice(0, 20)
+    if (excludeDomains.length) body.exclude_domains = excludeDomains.slice(0, 20)
     if (Number.isFinite(input.days) && input.days > 0) body.days = Math.min(365, Math.floor(input.days))
     //
     // 【实测确认帮倒忙的参数，别加回来】2026-09-04 对照实验（core/tavily.mjs 同目录无测试，

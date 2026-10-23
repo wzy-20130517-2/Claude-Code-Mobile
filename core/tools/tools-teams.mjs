@@ -19,6 +19,31 @@ import {
 
 const teamProp = { type: 'string', description: '团队名（同时也是任务列表名，Task 工具的 list 参数填同一个值）' }
 
+/**
+ * SendMessage 的输入归一：官方字段名 → CCM 内部字段名。
+ *
+ * 官方（claude.js:1021939）用 `recipient` / `content`，并有
+ * `backfillObservableInput` 做旧→新翻译（claude.js:1021957）。
+ * CCM 一直用 `to` / `text`，两套并存的结果是「按官方文档写的调用全失败」。
+ *
+ * 优先级：官方名 > CCM 旧名。同时给时以官方名为准，因为按官方文档写的人
+ * 是「照文档做对了」，不该被旧字段覆盖。
+ *
+ * 返回 null = 无需改动（基类约定）；否则返回新对象，不原地改调用方的 input。
+ */
+function coerceSendMessageInput(input) {
+  if (!input || typeof input !== 'object') return null
+  const to = input.to ?? input.recipient
+  const text = input.text ?? input.content ?? input.message
+  const needTo = to !== undefined && to !== input.to
+  const needText = text !== undefined && text !== input.text
+  if (!needTo && !needText) return null
+  const out = { ...input }
+  if (needTo) out.to = to
+  if (needText) out.text = text
+  return out
+}
+
 export class TeamCreateTool extends Tool {
   constructor() {
     super({
@@ -103,12 +128,75 @@ export class SendMessageTool extends Tool {
             type: 'boolean',
             description: '配合 respond 使用：true=同意（shutdown 则对方结束 / plan 则可以开工），false=驳回（plan 被驳回时请在 text 里写清要改什么）',
           },
+          // 【官方字段名】官方 SendMessage 用 recipient/content（claude.js:1021939），
+          // CCM 早期用 to/text。两个都收，官方名优先 —— 模型按训练习惯写
+          // recipient 在 CCM 上报「缺少 to」，用户完全看不出是用对了名字。
+          recipient: {
+            type: 'string',
+            description: '（官方同名字段，等价于 to）接收方名字。与 to 二选一，同时给时以 recipient 为准。',
+          },
+          content: {
+            type: 'string',
+            description: '（官方同名字段，等价于 text）完整消息内容。与 text 二选一，同时给时以 content 为准。',
+          },
+          message: {
+            type: 'string',
+            description: '（兼容别名，等价于 text）完整消息内容。三个字段都给时优先级：content > message > text。',
+          },
+          // 对齐官方 Claude Code 2.1.x 的 notify_when_idle。
+          //
+          // 场景：给一个**正在忙**的子 Agent 发补充指令。消息进了它的 inbox，
+          // 但它当前那轮还没结束，看不到。默认行为下你得自己记着「过会儿去问
+          // 它收到了没」。传 true 就在它这一轮跑完、转入空闲时自动回你一条
+          // 「[名字] 已空闲，inbox 有 N 条未读」——省掉一次人工轮询。
+          notify_when_idle: {
+            type: 'boolean',
+            description: '可选：对方当前正在跑时，等它这一轮结束、转入空闲后再通知你一次（默认 false 不通知）。适合「它忙完再处理这条」的场景',
+          },
         },
         // team 可选（2026-09-28）：没有团队也能给**子 Agent** 发消息 ——
         // to 匹配子 Agent 名时自动走 wake/steering 通道，不必先 TeamCreate。
-        required: ['from', 'to', 'text'],
+        // required 里不写 to/text：官方字段名是 recipient/content，
+        // 硬写 to 会让只传 recipient 的调用在校验层就被拒（走不到 coerceInput）。
+        // 实际必填由 validateInput 判（四选一即可）。
+        required: ['from'],
       },
       maxResultSizeChars: 8000,
+      isReadOnly: () => false,
+      isDestructive: () => false,
+      isConcurrencySafe: () => true,
+      searchHint: 'send messages to agent teammates',
+      backgrounding: 'never',
+      shouldDefer: true,
+      coerceInput: coerceSendMessageInput,
+      validateInput(input) {
+        const errors = []
+        const to = input.to ?? input.recipient
+        const text = input.text ?? input.content ?? input.message
+        if (!input.from || !String(input.from).trim()) errors.push('from 不能为空')
+        if (!to || !String(to).trim()) errors.push('需要接收方：to（或官方同名字段 recipient）')
+        // 对齐官方 claude.js:1020770 附近的两个校验：
+        //   to: z.string().regex(/^[^\n\r]*$/u, 'must be a single-line recipient name or address')
+        //              .regex(..., `recipient longer than any listed name or address (max ${v32103} characters)`)
+        // v32103 = Math.max(num321 + (2 + num524 + 1), num712) = max(200 + 15, 300) = 300。
+        // 防的是模型把整段 prompt 塞进 to：那种输入永远不会匹配到任何成员，
+        // 投递失败后模型往往只看到「不在团队里」，转头去改别的地方，浪费好几轮。
+        if (to && String(to).trim()) {
+          const toStr = String(to)
+          if (/[\n\r]/.test(toStr)) {
+            errors.push('to 必须是单行的接收方名字（不能含换行——正文请放 text/content）')
+          }
+          if (toStr.length > 300) {
+            errors.push(`to 长度 ${toStr.length} 超过上限 300 字符——接收方只填名字，正文请放 text/content`)
+          }
+        }
+        // 协议答复可以只带 approve，不带正文；其余情况必须有内容
+        const isProtocolReply = !!input.respond
+        if (!isProtocolReply && (text === undefined || text === null || String(text) === '')) {
+          errors.push('需要消息内容：text（或官方同名字段 content / message）')
+        }
+        return { valid: errors.length === 0, errors }
+      },
     })
   }
 
@@ -153,6 +241,16 @@ export class SendMessageTool extends Tool {
       if (r.rejected) return r.message + '\n' + r.hint
       if (!r.ok) return `唤醒 [${input.to}] 后出错：${r.error}`
 
+      // 【steering 分支】目标正在跑时 resumeSubagent 不重开 run，只把文本注入当前轮
+      // （plan.mjs 的 isRunning 分支）。它返回 {ok,name,steering,message} —— 没有
+      // duration_ms / total_messages / result，落到下面会格式化成 "NaN" 和 "undefined"，
+      // 文案还会误报「已跑完」。必须单独处理。
+      if (r.steering) {
+        return `[${r.name}] 正在执行中 —— 消息已作为 mid-turn steering 注入，下一轮模型调用前生效。\n`
+          + `没有重复启动实例，也不会打断当前工具批次。\n`
+          + `要等它的最终结果：AgentStatus({task_id}) 看进度，或 AgentOutput({task_id, block:true}) 等完成。`
+      }
+
       if (r.background) {
         return `已在后台唤醒 [${r.name}]（${r.type}）。\n`
           + `task_id: ${r.task_id}\n\n`
@@ -169,6 +267,9 @@ export class SendMessageTool extends Tool {
     //   shutdown      —— worker 请求收工，lead 同意后它才结束（避免半成品就跑掉）
     //   plan_approval —— worker 提交方案，lead 可以驳回并要求修改
     let payload = { ...input }
+    // 工具入参是下划线（notify_when_idle），内部 API 用驼峰。这里显式搬一次，
+    // 而不是在 teams.mjs 里再兼容一种命名 —— 两套命名并存最容易漏。
+    payload.notifyWhenIdle = input.notify_when_idle === true
     if (input.request) {
       const reqId = `${input.request}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
       const label = input.request === 'shutdown' ? '收工请求' : '方案审批请求'

@@ -1,6 +1,6 @@
 // 后台 Bash：run_in_background + BashOutput + KillShell（对标原版 Claude Code）
 import { spawn } from 'node:child_process'
-import { writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { writeFileSync, readFileSync, existsSync, openSync, closeSync, statSync, readSync } from 'node:fs'
 import { Tool } from '../tools/tools.mjs'
 import { maybeBackupRm } from '../session/trash.mjs'
 import { trackChild } from '../infra/pty.mjs'
@@ -19,7 +19,9 @@ function shellPath() {
   return getShellPath()
 }
 
-function startBackgroundBash(command, { timeout = 0, cwd = process.cwd() } = {}) {
+// 导出给 Monitor 工具复用（tools-monitor.mjs）：同一个后台任务管理体系，
+// 不另起一套 spawn。改这里的副作用都会同时影响 Monitor。
+export function startBackgroundBash(command, { timeout = 0, cwd = process.cwd() } = {}) {
   const task = registerBackgroundTask('local_bash', command.slice(0, 80))
   task.start()
 
@@ -44,6 +46,16 @@ function startBackgroundBash(command, { timeout = 0, cwd = process.cwd() } = {})
   proc.stdout.on('data', append)
   proc.stderr.on('data', append)
 
+  // 推式通道（Monitor 工具用）：stdout/stderr 的每个 chunk 同时喂给所有 sink。
+  // sink 由 attachOutputSink 挂上，负责按行切分 + 去重 + 上限。
+  // stdout 与 stderr 分别挂而不是合成一个流：两份流交错到达时，
+  // 合成流会在行边界出现错位的半行，按行切分会把一行拆成两半。
+  // 用 Set 而不是单个变量：多个消费者（两个 Monitor、或 Monitor + 别的观察者）
+  // 要能同时收，后挂的不能把先挂的顶掉 —— 那正是「重复调用 Monitor 就静默丢推送」的坑。
+  const sinks = new Set()
+  proc.stdout.on('data', (chunk) => { const s = String(chunk); for (const fn of sinks) { try { fn(s) } catch {} } })
+  proc.stderr.on('data', (chunk) => { const s = String(chunk); for (const fn of sinks) { try { fn(s) } catch {} } })
+
   let timer = null
   if (timeout && timeout > 0) {
     timer = setTimeout(() => {
@@ -61,13 +73,59 @@ function startBackgroundBash(command, { timeout = 0, cwd = process.cwd() } = {})
     if (task.isTerminal()) return
     task.exitCode = code
     task.complete({ exitCode: code, output_len: task.output.length })
+    // 进程退出：通知 sink flush 尾部半行。放在 complete 之后 ——
+    // sink 触发时 task 已是终态，工具据此发「任务已结束」通知。
+    if (task._closeListeners) {
+      const ls = task._closeListeners; task._closeListeners = []
+      for (const cb of ls) { try { cb() } catch {} }
+    }
   })
   proc.on('error', (e) => {
     if (timer) clearTimeout(timer)
     if (!task.isTerminal()) task.fail(e.message)
+    if (task._closeListeners) {
+      const ls = task._closeListeners; task._closeListeners = []
+      for (const cb of ls) { try { cb() } catch {} }
+    }
   })
 
+  // 推式通道出口：Monitor 工具经 attachOutputSink 挂消费者。
+  // 做成 task 上的 setter 而不是让 Monitor 自己去 proc 上挂 data 监听：
+  // 那样 Monitor 会与 append 抢同一个流，且拿不到「进程已退出」的时序。
+  task._setOutputSink = (fn) => {
+    if (typeof fn !== 'function') {
+      // 传 null = 摘除全部（任务收尾时用）
+      sinks.clear()
+      return
+    }
+    sinks.add(fn)
+    // 进程已退出时不会再触发 data —— 立刻 flush 一次让 sink 吐掉残留半行
+    if (task.isTerminal()) { try { fn('') } catch {} }
+  }
+
   return task
+}
+
+/**
+ * 给后台任务挂一个「输出 sink」：stdout/stderr 的每个 chunk 都会喂给它。
+ * @returns {boolean} 挂上返回 true；任务不存在或不是 startBackgroundBash 起的返回 false
+ */
+export function attachOutputSink(task, fn) {
+  if (!task || typeof task._setOutputSink !== 'function') return false
+  task._setOutputSink(fn)
+  return true
+}
+
+/**
+ * 注册进程退出回调（Monitor 用来 flush 尾部半行 + 发终止通知）。
+ * 已在终态则立即同步触发一次。
+ */
+export function onBackgroundTaskClose(task, cb) {
+  if (!task) return false
+  if (task.isTerminal()) { try { cb() } catch {}; return true }
+  task._closeListeners = task._closeListeners || []
+  task._closeListeners.push(cb)
+  return true
 }
 
 /** 给 PTYBashTool 注入：支持 run_in_background

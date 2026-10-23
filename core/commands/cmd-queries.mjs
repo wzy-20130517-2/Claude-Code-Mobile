@@ -47,6 +47,36 @@ export function makeQueryCommands(ctx) {
       return ctx.cmdStats(ctx.agent, ctx.sessionStartTime)
     },
 
+    /**
+     * /usage — 用量总览（对齐官方 2.1.303）
+     *
+     * 【官方语义】2.1.303 的 /usage 是 aliases: ["cost", "stats"]，
+     * 描述「Show session cost, plan usage, and activity stats」——
+     * 即它把 CCM 里分开的 /cost 与 /stats **合并成一条命令**，
+     * 两个旧名降级为别名。原来 CCM 反过来：/usage 只是 /cost 的别名，
+     * 于是「/usage 想看会话统计」根本拿不到。
+     *
+     * 【为什么保留 /cost /stats 而不是删掉】老用户手熟、CLAUDE.md 和
+     * 历史会话里到处都是这两个名字，删了就是无声破坏。做法与官方一致：
+     * 三个名字都能用，/usage 是正式入口，/cost /stats 是别名。
+     * 但**别名要能拿到全量**，不能仍是各自那一小段 —— 所以三个入口都走这里。
+     *
+     * 【为什么不带子命令分流】官方 /usage 无参数（argumentHint 为空）。
+     * 加 `usage cost` / `usage stats` 这种分流会让「一条命令看到全部」
+     * 这个核心价值消失，而分段信息在输出里本来就是分块的。
+     */
+    usage() {
+      // 不写 this.cost()：模块内的 handler 可能被解构后单独调用
+      //（注册表 / Web 适配器都可能这么干），那时 this 是 undefined。
+      const u = ctx.agent.getTokenUsage()
+      const lastP = ctx.agent.getLastPromptTokens()
+      return [
+        `Token 统计:\n  当前上下文: ${lastP}\n  累计输出: ${u.output}\n  缓存读: ${u.cacheRead || 0}`,
+        '',
+        ctx.cmdStats(ctx.agent, ctx.sessionStartTime),
+      ].join('\n')
+    },
+
     /** /errors — 本进程记录的错误（recentErrors 是数组，不是函数） */
     errors() {
       const arr = ctx.recentErrors
@@ -262,8 +292,46 @@ export function makeSessionCommands(ctx) {
     },
 
     /**
-     * /clear — 清空当前对话的聊天记录（会话 ID 不变）。
-     * 想开一个全新对话用 /new。
+     * /clear — 开一个新会话（对齐官方 2.1.303）。
+     *
+     * 【2026-10-22 语义对齐】官方 `claude.js:946607` 的 /clear 是
+     * `aliases: ["reset", "new"]`，行为是开新会话，旧会话留盘可用 /resume 找回。
+     * CCM 原来是「清空当前会话但保留 sessionId」，与官方语义相反 ——
+     * 用户按官方习惯敲 /clear 期待换新会话，拿到的却是同一个会话被清空。
+     * 现在 /clear /reset /new 三者等价，都走本函数。
+     *
+     * 原来「清空但保留 sessionId」的行为改名为 /clear-history（仍有回收站可恢复）。
+     */
+    clear() {
+      const oldId = ctx.sessionId()
+      // 先存盘，保证旧会话能被 /resume 找回（官方也是这个语义）
+      try { ctx.saveSession() } catch { /* 存不下不拦开新会话 */ }
+      const newId = ctx.newSessionId()
+      ctx.setSessionId(newId)
+      ctx.setSessionTitle(null)
+      ctx.setTodos([])
+      ctx.setIncognito(false)
+      ctx.agent.clear()
+      ctx.agent.systemPrompt = ctx.getCurrentSystemPrompt?.() || ctx.agent.systemPrompt
+      const fs = ctx.fsSession?.()
+      try {
+        fs?.clearBody?.()
+        // 新会话的视觉起点（对齐启动路径的 New Session Start 线）。
+        if (fs?.writeLine && ctx.sessionDividerLines) {
+          for (const line of ctx.sessionDividerLines()) fs.writeLine(line)
+        }
+        fs?.flushRender?.()
+      } catch {}
+      // 新会话也是一次会话开始（官方 source 枚举里有 'clear'）
+      try { ctx.hookManager?.trigger?.('SessionStart', { event: 'SessionStart', source: 'clear' })?.catch?.(() => {}) } catch {}
+      return `当前对话已保存 (ID: ${oldId})，已开始新对话 (ID: ${newId})。用 /resume ${oldId} 可恢复旧对话。`
+    },
+
+    /**
+     * /clear-history — 清空当前对话的聊天记录（会话 ID 不变）。
+     *
+     * 这是 CCM 原有的 /clear 行为，2026-10-22 因 /clear 让位给官方语义而改名。
+     * 想开全新对话用 /clear（或 /new、/reset）。
      *
      * 【为什么要先存回收站】清空不可逆，用户手滑敲了就没了。
      * 存 JSON 到 .claude-code-mobile/cleared/，/clear-restore 可捞回来。
@@ -273,7 +341,7 @@ export function makeSessionCommands(ctx) {
      * 依赖 ctx 上的 fs 方法（existsSync/mkdirSync/writeFileSync/readdirSync/rmSync）
      * 和 join —— 两端 ctx 都提供了这些，模块本身不 import node:fs。
      */
-    clear() {
+    'clear-history'() {
       const sid = ctx.sessionId()
       const before = ctx.agent.getHistory().length
       try {
@@ -305,7 +373,11 @@ export function makeSessionCommands(ctx) {
       const fs = ctx.fsSession?.()
       if (fs) { try { fs.clearBody(); fs.flushRender() } catch { /* 渲染器状态异常不该拦住命令 */ } }
       try { ctx.saveSession() } catch {}
-      return `已清空当前对话（${before} 条），会话 ID 仍是 ${sid}。\n清掉的内容已存入对话回收站：/clear-restore 查看 · /clear-restore <序号> 恢复。开新对话用 /new。`
+      // /clear 也是一次会话开始（对齐官方 source 枚举里的 'clear'）。
+      // 不触发的话，依赖 SessionStart 做初始化的 hook（重置计数、重新读配置、
+      // 开新的日志文件）在 /clear 之后仍然沿用上一段对话的状态。
+      try { ctx.hookManager?.trigger?.('SessionStart', { event: 'SessionStart', source: 'clear' })?.catch?.(() => {}) } catch {}
+      return `已清空当前对话（${before} 条），会话 ID 仍是 ${sid}。\n清掉的内容已存入对话回收站：/clear-restore 查看 · /clear-restore <序号> 恢复。开新对话用 /clear。`
     },
 
     /**
@@ -340,30 +412,11 @@ export function makeSessionCommands(ctx) {
     },
 
     /**
-     * /new — 保存当前对话并开一个新会话（原 /clear 的行为，2026 改名）。
-     * 与 /clear 的区别：/clear 留在原会话里清空，/new 换一个新 sessionId。
+     * /new — 官方 /clear 的别名（`aliases: ["reset", "new"]`）。
+     * 2026-10-22 起与 /clear 完全等价，直接复用同一实现，避免两套逻辑漂移。
      */
     new() {
-      const oldId = ctx.sessionId()
-      try { ctx.saveSession() } catch { /* 旧会话存不下也别拦住开新会话 */ }
-      const newId = ctx.newSessionId()
-      ctx.setSessionId(newId)
-      ctx.setSessionTitle(null)
-      ctx.setTodos([])
-      ctx.setIncognito(false)
-      ctx.agent.clear()
-      ctx.agent.systemPrompt = ctx.getCurrentSystemPrompt?.() || ctx.agent.systemPrompt
-      const fs = ctx.fsSession?.()
-      try {
-        fs?.clearBody?.()
-        // 新会话的视觉起点（对齐启动路径的 New Session Start 线）。
-        // 只 clearBody 会留一片空白，用户看不出"新对话从这开始"。
-        if (fs?.writeLine && ctx.sessionDividerLines) {
-          for (const line of ctx.sessionDividerLines()) fs.writeLine(line)
-        }
-        fs?.flushRender?.()
-      } catch {}
-      return `当前对话已保存 (ID: ${oldId})，已开始新对话 (ID: ${newId})。用 /resume ${oldId} 可恢复旧对话。`
+      return this.clear()
     },
 
     /**

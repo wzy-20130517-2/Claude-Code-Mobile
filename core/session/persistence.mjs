@@ -1,5 +1,5 @@
 // Claude Code Mobile - 持久化
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, openSync, readSync, closeSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, openSync, readSync, closeSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 import { backupToTrash } from './trash.mjs'
 import { atomicWrite } from '../infra/atomic.mjs'
@@ -190,11 +190,31 @@ export class SessionStore {
       }
     } catch { /* 清理失败不阻塞保存 */ }
   }
+  /**
+   * 读取会话。找不到或解析失败都返回 null，但**解析失败会把原文件改名保留**。
+   *
+   * 【为什么必须保留（2026-10-20）】原来解析失败直接 `return null`，
+   * 表面上无害（启动路径 tryResume 不会崩），实际是数据丢失的入口：
+   *   1. 用户感知是「会话凭空消失」—— /load 里还在（文件名还在），
+   *      但 /resume 说恢复不了，没有任何提示说明为什么
+   *   2. 更糟的是后续 save 会写到**同一个路径**，把唯一副本覆盖掉。
+   *      一个偶发的半截写入/磁盘满，就永久毁掉整段对话。
+   * 改名成 `.orphaned-<时间戳>` 后：原内容一字不丢，用户能自己打开抢救，
+   * 新会话也能正常写入同名文件（不冲突），且日志留痕说明发生了什么。
+   */
   load(sid) {
     const f = join(this.sessionsDir, `${sid}.json`)
     if (!existsSync(f)) return null
-    // 损坏文件不能让启动路径（tryResume）崩溃，解析失败返回 null
-    try { return JSON.parse(readFileSync(f,'utf-8')) } catch { return null }
+    try {
+      return JSON.parse(readFileSync(f, 'utf-8'))
+    } catch (e) {
+      const orphan = `${f}.orphaned-${Date.now()}`
+      try { renameSync(f, orphan) } catch { /* 改名失败也不能让调用方崩 */ }
+      try {
+        this.logger?.warn?.(`[Session] ${sid} 解析失败（${e.message}），原文件已保留为 ${orphan}`)
+      } catch { /* logger 自身出错不影响主流程 */ }
+      return null
+    }
   }
   list() { return existsSync(this.sessionsDir) ? readdirSync(this.sessionsDir).filter(f => f.endsWith('.json')).map(f => f.replace('.json','')) : [] }
   /**

@@ -18,6 +18,41 @@ function parseFrontmatter(raw) {
   return { meta, body }
 }
 
+/**
+ * 运行时注册的命令表（进程级，跨 loader 实例共享）。
+ *
+ * 【为什么不是 loader 实例上的字段】MCP 是异步就绪的，prompt 到达时
+ * customCommands 已经建好了；要让它看见，要么改 index.mjs 把 loader
+ * 传进 MCP（那会多改一个别人的文件、还要处理时序），要么用一张模块级表
+ * 让所有实例都能读到。后者 reload() 时自动重放，代价是跨实例共享 ——
+ * 本进程只有一个 CLI 或一个 Web 会话在用，可接受。
+ */
+const dynamicCommands = new Map()
+
+/**
+ * 注册一条运行时命令（MCP prompt 转 slash 命令用）。
+ * body 存 prompt 的展开说明；source 标 'mcp:<server>' 供排查。
+ */
+export function registerDynamicCommand(name, entry) {
+  const n = String(name || '').replace(/^\//, '').trim()
+  if (!n || n.includes('/') || n.includes('..')) return false
+  dynamicCommands.set(n, {
+    name: n,
+    description: entry?.description || '',
+    argumentHint: entry?.argumentHint || '',
+    body: entry?.body || '',
+    source: entry?.source || 'dynamic',
+    dynamic: true,
+  })
+  return true
+}
+
+/** 撤掉某个前缀下所有动态命令（MCP 重连时先清再重建）。 */
+export function clearDynamicCommands(prefix) {
+  if (!prefix) dynamicCommands.clear()
+  else for (const k of [...dynamicCommands.keys()]) if (k.startsWith(prefix)) dynamicCommands.delete(k)
+}
+
 export class CustomCommandLoader {
   constructor(roots = []) {
     this.roots = roots
@@ -27,6 +62,7 @@ export class CustomCommandLoader {
 
   reload() {
     this.commands.clear()
+    for (const [name, entry] of dynamicCommands) this.commands.set(name, entry)
     for (const root of this.roots) {
       if (!existsSync(root)) continue
       let files = []
@@ -56,6 +92,8 @@ export class CustomCommandLoader {
       name: c.name,
       description: c.description,
       source: c.source,
+      argumentHint: c.argumentHint || '',
+      dynamic: c.dynamic === true,
     }))
   }
 
@@ -76,6 +114,8 @@ export class CustomCommandLoader {
       description: c.description,
       content: body,
       source: c.source,
+      argumentHint: c.argumentHint || '',
+      dynamic: c.dynamic === true,
     }
   }
 

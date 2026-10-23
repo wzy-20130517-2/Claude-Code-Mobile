@@ -77,6 +77,12 @@ GitHub
 /github test             验证连通性
 /github logout           清除 token
 工具：GitHubRepo/Issues/IssueView/PRs/PRComments/Comment/CreateIssue/File
+
+连接器总览
+/connectors              看全部连接器状态（GitHub / QQ / MCP / 邮箱）
+/connectors <id>         看单个详情，如 /connectors qq
+说明：只读本地配置、不发网络请求。真实连通性用 /github test、/qq status、
+  /mcp status、/mail 各自验证。
 字段：display_name / full_name / work_function / personal_preferences
 /temperature [0.0-2.0]        生成温度`,
 
@@ -108,12 +114,20 @@ GitHub
 /load             列出所有会话
 /save             手动保存
 /rename <名称>     给当前对话命名
+                  注：官方 /rename 有别名 /name，但 CCM 的 /name 已被
+                  「改 Provider 显示名」占用，所以没做这个别名。
+                  改 Provider 编号用 /config provider rename。
 /delete <id|all>  删除指定 / 全部（保留当前）
 /branch [名称]     从当前对话创建分支
 /export [文件]     导出对话（.md/.html/.json）
+                  /export --clipboard [格式] 复制到剪贴板（不落盘）
 /incognito        隔离对话：不加载 CLAUDE.md，禁写本项目
 /undo             撤销文件修改（支持跨文件）
+                  注：CCM 的 /undo 是「立即撤销最近一次改动」，一步到位；
+                  官方 /undo 是 /rewind 的别名（两步：列检查点 → 选一个）。
+                  要官方式的两步流程用 /rewind，或 /rewind undo。
 /rewind           检查点恢复（文件或消息）
+                  别名 checkpoint；/rewind undo 等价于 /undo
 /retry            回到上次报错前并带报错重跑
 /trash            回收站：restore <序号> / clear
 /btw <问题>        顺嘴问一句，不打断主对话、不进主上下文
@@ -125,24 +139,27 @@ GitHub
       tools: `工具 / 诊断
 ━━━━━━━━━━━━━━━━━━━━━━━━
 /status       版本/模型/上下文/工具 一屏汇总
+              加 probe 参数（/status probe）额外探测 API 连通性，最多 3s
 /doctor       诊断安装与配置问题
 /check        重启预检：语法 + 未声明变量
 /tools        已注册工具及只读/并发属性
 /errors       最近运行错误
 /stats        使用统计
 /trace        Agent trace（list/show/status/path）
-/hooks        Hooks 配置与事件数量
+/hooks        Hooks 配置与事件数量（/hooks edit 打开编辑器改，保存后热重载）
 /diff         git diff（--staged 看暂存，--task 只看本轮改动）
 /review       工作区审查（git/大文件/TODO/安全）
 /workflow     Explore→Plan→Implement→Review 说明
 /skills       Skills 摘要（<关键词> 搜索，page <页> 分页）
 /plugin      插件（DSH 生态宿主；/plugins 别名）
 /permissions  工具权限规则（allow/deny/ask）
-/permissions mode <default|acceptEdits|plan|bypassPermissions>
+/permissions mode <default|acceptEdits|dontAsk|plan|bypassPermissions>
 /context7     Context7 MCP（setup/enable/disable/status）
 /bg-list      后台任务列表（/bg-status <id> 看单个）
-/tasks        持久化任务（跨重启存活，子 Agent 可领取协作）
-          /tasks [列表名] · lists 看所有列表 · clear 清空
+/tasks        后台进程（对齐官方语义；aliases 里官方叫 bashes）
+          /tasks 看列表 · /tasks <id> 看详情 · /tasks stop <id|名字> 中止
+/tasklist     持久化任务（跨重启存活，子 Agent 可领取协作）
+          /tasklist [列表名] · lists 看所有列表 · clear 清空
 /agents       子 Agent 状态：谁在跑、跑了多久、卡住了吗
           cards 看角色卡 · reload 改完立刻生效 · new 进向导建卡
 /team         多 Agent 协作团队（团队名 = 任务列表名）
@@ -190,6 +207,8 @@ Ctrl+G               删除当前翻到的排队消息（发错了不用干等�
   official              官方 —— 对齐 claude-code darkTheme 的真彩色
   也认中文：/markdown 经典 · /markdown 鲜艳
 /voice                正文语音朗读（像豆包那样念给你听）
+                  注：与官方 /voice 不是同一个东西 —— 官方是「语音输入模式」
+                  （hold/tap/off 控制按住说话），CCM 是「把回复念出来」。
   on | off              开关（工具调用不念，只念正文）
   <音色>                 yunxia 少年音(默认) / xiaoxiao 女声温和
                         yunxi 男声沉稳 / yunjian 男声浑厚
@@ -250,8 +269,8 @@ Ctrl+G               删除当前翻到的排队消息（发错了不用干等�
       /update mirror <url>     设置镜像前缀（默认 gh-proxy.com）
       /update mirror off       直连 GitHub（国内可能不通）
       启动时会自动静默检查，有新版会打黄色提示
-/add-dir <路径>     添加工作目录
 /workspace [路径]   查看/设置工作区（默认 /sdcard/Download/claude-workspace）
+                    文件工具本来就能读写任意绝对路径，不需要额外「加目录」
 
 /image [路径|序号] [说明]  发图给我看（无参=最新截图；/image 3=最近第3张；/image list 挑图；vision on 时原图直入）
 
@@ -292,7 +311,7 @@ description: 技能描述
 export const HELP_TOPIC_ALIASES = {
   goal: 'tools', watch: 'tools', deep: 'tools', plan: 'tools', away: 'tools',
   key: 'model', url: 'model', name: 'model', config: 'model', provider: 'model',
-  agents: 'tools', team: 'tools', tasks: 'tools', mcp: 'ext', skills: 'ext',
+  agents: 'tools', team: 'tools', tasks: 'tools', tasklist: 'tools', mcp: 'ext', skills: 'ext',
   compact: 'context', memory: 'context', mem: 'context',
   save: 'session', load: 'session', resume: 'session', rewind: 'session',
   font: 'ui', board: 'ui', statusline: 'ui', keys: 'ui', editor: 'ui', markdown: 'ui',

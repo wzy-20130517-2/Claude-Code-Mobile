@@ -124,6 +124,39 @@ export function getBackgroundTask(taskId) {
   return backgroundTasks.get(taskId) || null
 }
 
+/**
+ * 按「agent 名字」反查后台任务 —— 对齐官方 2.1.303 TaskStop 的能力：
+ * `task_id` 除了 id，也接受 agent-team teammate 的 ID 或名字。
+ *
+ * 【为什么要它】spawn 时给了 agent_name（worker-1 / reviewer），调用方记住的
+ * 是**名字**而不是那串 a1b2c3d4 的 id。原来 AgentStop 只认 id，想中止就得
+ * 先 AgentStatus 翻一遍列表把 id 抄过来 —— 多一步，且容易抄错。
+ *
+ * 【匹配规则（顺序敏感）】
+ *   1. 完全等于 agentName
+ *   2. 完全等于 description（spawn 时的短描述，没给 agent_name 时会用它当名字）
+ *   3. 忽略大小写的 agentName / description
+ * 返回**最近注册**的那个（倒序遍历）：同名重派过几次时，用户想停的几乎总是
+ * 最新那个在跑着的。
+ *
+ * 只返回未进终态的：已结束的任务没什么可中止的，返回它只会让调用方
+ * 拿到一句「已经是终态」的废话。终态查询请用 AgentStatus。
+ */
+export function findTaskByName(name) {
+  const want = String(name || '').trim()
+  if (!want) return null
+  const lower = want.toLowerCase()
+  const all = [...backgroundTasks.entries()].reverse()   // 新的在前
+  const pick = (pred) => {
+    for (const [, t] of all) if (!t.isTerminal() && pred(t)) return t
+    return null
+  }
+  return pick(t => t.agentName === want)
+    || pick(t => t.description === want)
+    || pick(t => String(t.agentName || '').toLowerCase() === lower)
+    || pick(t => String(t.description || '').toLowerCase() === lower)
+}
+
 export function getBackgroundTaskStatus(taskId) {
   const task = backgroundTasks.get(taskId)
   if (!task) return null
@@ -201,4 +234,13 @@ export function gcTerminalTasks() {
       backgroundTasks.delete(id)
     }
   }
+}
+
+// 惰性 GC：每次列表/状态查询顺手清一次终态任务（5 分钟前）。
+// 原来只有 definition 没有调用方 —— 后台任务 Map 只增不减，
+// sink 闭包（Monitor 的 stdout 监听）随 task 慢性滞留，长会话内存缓慢上涨。
+// 放在读取路径上而不是定时器：零常驻开销，且「看得到的状态」永远是刚清过的。
+export function listBackgroundTasksGc() {
+  gcTerminalTasks()
+  return listBackgroundTasks()
 }

@@ -14,6 +14,7 @@ import { Tool } from './tools.mjs'
 import {
   snapshot, setGoalStatus, reviseGoal, noteBlocker,
   parseDuration, parseCount, BLOCKED_STREAK_THRESHOLD,
+  DEFAULT_TURN_BUDGET, writeProposal,
 } from '../agent/goal.mjs'
 import { budgetLine, buildGoalContract } from '../agent/goal-runtime.mjs'
 
@@ -46,6 +47,106 @@ export class GetGoalTool extends Tool {
       '',
       `阻塞计数：${s.blockedStreak}/${s.blockedThreshold}（未达阈值不准判 blocked）`,
     ].join('\n')
+  }
+}
+
+/**
+ * ProposeGoal —— 模型提议一个目标，等用户一键批准。
+ *
+ * 【与「不给模型 CreateGoal」的关系】不冲突，而且正是官方 2.1.303 的做法
+ *（claude.js:1010728 的 ProposeGoal，`shouldDefer: true`、`isReadOnly: true`）。
+ *
+ * 原设计禁的是「模型给自己发无人监督的长跑许可」：CreateGoal 会直接落盘一个
+ * active 目标，然后 runtime 开始自动续轮烧 token，用户全程没参与。
+ * ProposeGoal 只**写一条待批准提议**，不创建目标、不启动自动推进 ——
+ * 用户点批准（`/goal approve`）才真正落盘。区别在于**控制权在谁手里**。
+ *
+ * 为什么值得加：目标由用户手写时，他往往只写「修好 X」这种一句话，
+ * 缺完成判据 → 模型只能靠自我感觉判断做完了，或者烧到预算耗尽。
+ * 模型读完代码后其实最清楚「这个任务的可验证完成判据是什么」，
+ * 让它先提一个带判据的版本，用户按一下 y 就行 —— 判据质量显著提高。
+ */
+export class ProposeGoalTool extends Tool {
+  constructor(getSessionId) {
+    super({
+      name: 'ProposeGoal',
+      description: '提议一个会话目标（完成契约），等用户一键批准。'
+        + '**这不是创建目标** —— 提议不会启动自动推进，也不会消耗预算；用户批准后才生效。'
+        + '用途：你读完代码后比用户更清楚「怎么验证这活干完了」，提议一个带完成判据的版本，'
+        + '比让用户手写一句话目标（往往缺判据）质量高得多。'
+        + '【不要滥用】只在任务确实需要多轮无人监督推进时提议；一问一答的小事不要提。',
+      input_schema: {
+        type: 'object',
+        properties: {
+          condition: {
+            type: 'string',
+            description: '完成条件，写成**另一个评估者能从对话里验证**的形式'
+              + '（例："tests/auth 下所有测试通过（bun test 退出码 0）"）。不要写"把 X 做好"这种无法验证的话。',
+          },
+          // 官方 schema 只有 condition；这两个是 CCM 的补充，让提议直接可用
+          objective: {
+            type: 'string',
+            description: '可选：目标本身（要做什么）。省略时用 condition 当目标描述。',
+          },
+          boundaries: {
+            type: 'array', items: { type: 'string' },
+            description: '可选：边界/禁区（不许改哪些文件、不许做什么）。',
+          },
+          budget_turns: {
+            type: 'number',
+            description: `可选：轮次预算，默认 ${DEFAULT_TURN_BUDGET}。手机上不建议给无上限。`,
+          },
+        },
+        required: ['condition'],
+      },
+      isReadOnly: () => true,
+      isDestructive: () => false,
+      isConcurrencySafe: () => false,
+      // 官方 ProposeGoal 的三个元数据（claude.js:1010728）
+      searchHint: 'propose a session goal condition for the user to approve with one keypress',
+      backgrounding: 'never',
+      shouldDefer: true,
+      maxResultSizeChars: 1000,
+      validateInput(input) {
+        const errors = []
+        if (!input.condition || !String(input.condition).trim()) {
+          errors.push('condition 必填：写成可被验证的完成条件，不是"做好 X"')
+        }
+        return { valid: errors.length === 0, errors }
+      },
+    })
+    this.getSessionId = getSessionId
+  }
+
+  async execute(input) {
+    const sid = resolveSid(this.getSessionId)
+    const existing = snapshot(sid)
+    // 已有进行中的目标时不再提议 —— 用户要么先 /goal clear，要么用 /goal replace。
+    // 静默覆盖会让他丢掉正在跑的目标（连带预算和进度），那是最坏的结果。
+    if (existing && existing.status === 'active') {
+      return `当前已有进行中的目标，未提议：\n  ${existing.objective}\n`
+        + `要换目标请用户先 /goal replace <新目标> 或 /goal clear。`
+    }
+    const proposal = {
+      condition: String(input.condition).trim(),
+      objective: String(input.objective || input.condition).trim(),
+      boundaries: (input.boundaries || []).map(s => String(s).trim()).filter(Boolean),
+      budgetTurns: Number.isFinite(input.budget_turns) && input.budget_turns > 0
+        ? Math.floor(input.budget_turns)
+        : DEFAULT_TURN_BUDGET,
+      proposedAt: new Date().toISOString(),
+    }
+    try {
+      writeProposal(sid, proposal)
+    } catch (e) {
+      return `提议写入失败：${e?.message || String(e)}`
+    }
+    return `已提议目标（**尚未生效**，等用户批准）：\n`
+      + `  目标：${proposal.objective}\n`
+      + `  完成判据：${proposal.condition}\n`
+      + (proposal.boundaries.length ? `  边界：${proposal.boundaries.join('；')}\n` : '')
+      + `  预算：${proposal.budgetTurns} 轮\n\n`
+      + `用户敲 \`/goal approve\` 采纳，或 \`/goal reject\` 拒绝。`
   }
 }
 
@@ -182,5 +283,6 @@ export function createGoalTools(getSessionId) {
     new GetGoalTool(getSessionId),
     new GoalStatusTool(getSessionId),
     new SetGoalBudgetTool(getSessionId),
+    new ProposeGoalTool(getSessionId),
   ]
 }

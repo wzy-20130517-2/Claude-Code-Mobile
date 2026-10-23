@@ -15,6 +15,8 @@ import { MCP_PATH } from '../infra/paths.mjs'
 // /tvly 用：读取走 getTavilyKey（与 WebSearch 实际那条取值链同一实现），
 // 写完必须 resetTavilyKeyCache —— 模块级 cachedKey 不会因为文件变了自己失效。
 import { getTavilyKey, resetTavilyKeyCache } from '../tools/tavily.mjs'
+// /connectors 用：连接器注册表（单一真值源，Web 的 /api/connectors/status 也读它）
+import { listConnectors, getConnector, connectorStatus, allConnectorStatuses, connectorSummary } from '../integrations/connectors.mjs'
 
 /**
  * @param {object} ctx
@@ -143,13 +145,102 @@ export function makeIntegrationCommands(ctx) {
     },
 
     /**
+     * /connectors — 统一入口：看所有「需要配置才能用的外部服务」的状态
+     *
+     * 【为什么需要】
+     * 在这之前，想知道「我配了什么」要分别敲 /github、/qq、/mcp、/mail ——
+     * 四个命令，四套输出格式，而且没有一个地方能回答「哪些还没配」。
+     * Web 端的连接器页面只认 GitHub + QQ（前端 catalog 里就这两条），
+     * 新加的连接器不会出现在那里。
+     *
+     * 【为什么不做 install / enable】
+     * 每个连接器的凭据获取路径完全不同（GitHub 是 PAT、QQ 是 NapCat + 主人号、
+     * MCP 是命令行、邮箱是 IMAP 授权码）。统一按钮只能统一成「去终端敲 X」，
+     * 那不如直接把 X 告诉你。官方的 SearchMcpRegistry / SuggestConnectors
+     * 能做「一键连接」是因为它们背后有 claude.ai 的托管鉴权，CCM 没有。
+     *
+     * 【与各命令的分工】
+     *   /connectors      —— 只读总览（离线、秒回，不发网络请求）
+     *   /github test     —— 真打 API 验 token 与仓库
+     *   /qq status       —— 看桥进程与队列
+     *   /mcp status      —— 看每个服务器的工具清单
+     * 总览不冒充连通性测试：它只回答「配置到位了吗」，能不能真的通由各自的 test 回答。
+     */
+    connectors(args) {
+      const { C } = ctx
+      const sub = String(args[0] || '').toLowerCase()
+      // mcpClient 可能是 null（Web 端懒建），探针自己会降级成「运行状态未知」
+      const opts = { mcpClient: ctx.mcpClient || null }
+
+      if (sub === 'help' || sub === '--help' || sub === '-h') {
+        return `连接器 = 需要配置凭据/服务才能用的外部接入点。\n\n`
+          + `  /connectors           看全部连接器与状态\n`
+          + `  /connectors <id>      看单个（github | qq | mcp | mail）\n\n`
+          + `状态判定只读本地配置，不发网络请求 —— 真实连通性用各自的测试命令：\n`
+          + `  /github test · /qq status · /mcp status · /mail\n`
+      }
+
+      // 单个连接器详情
+      if (sub && sub !== 'list' && sub !== 'status') {
+        const one = connectorStatus(sub, opts)
+        if (!one) {
+          return `没有名为 "${sub}" 的连接器\n可用: ${listConnectors().map(c => c.id).join(' / ')}`
+        }
+        const badge = one.connected ? `${C.green}已连接${C.reset}` : `${C.yellow}未连接${C.reset}`
+        const lines = [
+          `${one.title}  ${badge}`,
+          `  ${one.summary}`,
+          `  状态  ${one.detail}`,
+        ]
+        // 各连接器的附加信息（按探针实际给出的字段渲染，没给就不显示）
+        if (one.id === 'mcp' && Array.isArray(one.servers)) {
+          for (const s of one.servers) {
+            const label = { running: '运行中', disabled: '已禁用', disconnected: '未连接', unknown: '状态未知' }[s.state] || s.state
+            lines.push(`    ${s.name}  ${label}${s.toolCount != null ? ` · ${s.toolCount} 个工具` : ''}`)
+          }
+        }
+        if (one.id === 'mail' && Array.isArray(one.accounts)) {
+          for (const a of one.accounts) {
+            lines.push(`    ${a.isDefault ? '●' : '○'} ${a.alias}${a.domain ? `  @${a.domain}` : ''}`)
+          }
+        }
+        if (one.id === 'qq' && Array.isArray(one.otherEndpoints) && one.otherEndpoints.length) {
+          lines.push(`    ${C.dim}其他端在监听: ${one.otherEndpoints.join(', ')}（端口共用，同一时间只能一个端监听）${C.reset}`)
+        }
+        if (one.error) lines.push(`  ${C.yellow}探针报错: ${one.error}${C.reset}`)
+        lines.push('')
+        lines.push(`  ${C.dim}配置: ${one.configCommand}   查连通性: ${one.statusCommand}${C.reset}`)
+        return lines.join('\n')
+      }
+
+      // 总览
+      const all = allConnectorStatuses(opts)
+      const sum = connectorSummary(opts)
+      const lines = [`连接器 ${sum.connected}/${sum.total} 已连接：`]
+      for (const c of all) {
+        const dot = c.connected ? `${C.green}●${C.reset}` : `${C.dim}○${C.reset}`
+        lines.push(`  ${dot} ${c.title.padEnd(12)} ${c.detail}`)
+      }
+      lines.push('')
+      if (sum.disconnectedIds.length) {
+        lines.push(`${C.dim}未连接: ${sum.disconnectedIds.map(id => `/${getConnector(id)?.configCommand?.replace(/^\//, '') || id}`).join(' · ')}${C.reset}`)
+      }
+      lines.push(`${C.dim}/connectors <id> 看单个详情（${all.map(c => c.id).join(' / ')}）· /connectors help${C.reset}`)
+      return lines.join('\n')
+    },
+
+    /**
      * /mcp — 管理 MCP 服务器（对齐官方 commands/mcp）
      *
-     * 官方定位是 'Manage MCP servers'，argumentHint '[enable|disable [server-name]]'。
+     * 官方定位是 'Manage MCP servers'，2.1.303 的 argumentHint 是
+     * `[reconnect (<server>|all)|enable|disable [<server>|all]]`。
      * MCP 的**工具**不做成 slash 命令（走 mcp_<server>_<tool> 工具通道），
-     * 这个命令只管服务器的启停与状态查看。
+     * 这个命令只管服务器的启停/重连与状态查看。
+     *
+     * 【为什么是 async】reconnect 要真的重新 spawn 子进程 + 重新握手拉工具清单，
+     * 那是异步的。其他分支保持同步返回，调用方 await 一个同步返回值也没问题。
      */
-    mcp(args) {
+    async mcp(args) {
       const { C, mcpClient } = ctx
       const sub = String(args[0] || '').toLowerCase()
       const readMcpCfg = () => {
@@ -166,23 +257,58 @@ export function makeIntegrationCommands(ctx) {
           return 'MCP: 未配置任何服务器\n配置文件: mcp.json\n用法: /mcp enable|disable <名字> · /mcp tools <名字>'
         }
         const lines = ['MCP 服务器：']
+        // 状态细分对齐官方（num137.js:100391 的状态优先级表
+        // ["connected","cached","pending","needs-auth","failed","disabled"]），
+        // 但只报 CCM 真的能判定的那几种 —— 见下面 cannotShow 的说明。
+        //
+        // CCM 可判定的依据全部来自 MCPClient.servers 里那个 serverState：
+        //   disabled  配置里 disabled === true（没进 servers）
+        //   failed    serverState.dead 有值（spawn ENOENT / 进程退出，见 mcp-client.mjs 的 failPending）
+        //   connected !dead 且 tools 非空（initialize + tools/list 都过了）
+        //   pending   !dead 但 tools 为空（进程活着、握手没成或超时）
+        //   not-started 配置里有、servers 里没有（loadConfig 时 addServer 返回 null 被跳过）
+        const servers = mcpClient?.servers || new Map()
+        const cannotShow = []
+        let connectedCount = 0
         for (const [name, srv] of configured) {
-          const live = mcpClient.servers.get(name)
+          const live = servers.get(name)
           const disabled = srv?.disabled === true
-          // 三种状态要分清：配置里禁用 / 配了但没连上 / 正常运行
-          const state = disabled
-            ? `${C.dim}已禁用${C.reset}`
-            : live
-              ? `${C.green}运行中${C.reset} · ${live.tools?.length || 0} 个工具`
-              : `${C.yellow}未连接${C.reset}`
+          let state
+          if (disabled) {
+            state = `${C.dim}disabled · 已禁用${C.reset}`
+          } else if (!live) {
+            // 配置里有、servers 里没有 = 根本没启动起来（loadConfig 时 addServer
+            // 返回 null 被跳过，或启动后才加进 mcp.json）。这和「启动过又挂了」
+            // （live.dead）是两件事，分开报，否则排查时会去翻不存在的崩溃日志。
+            state = `${C.yellow}not-started · 未启动${C.reset}`
+          } else if (live.dead) {
+            state = `${C.red}failed · ${String(live.dead).slice(0, 60)}${C.reset}`
+          } else if (live.tools?.length) {
+            state = `${C.green}connected · 运行中 · ${live.tools.length} 个工具${C.reset}`
+            connectedCount++
+          } else {
+            state = `${C.yellow}pending · 进程在但没拿到工具${C.reset}`
+          }
           lines.push(`  ${name}  ${state}`)
           if (live?.tools?.length && sub === 'status') {
             lines.push(`    ${live.tools.map(t => t.name).join(', ')}`)
           }
         }
-        const running = configured.filter(([n, s]) => s?.disabled !== true && mcpClient.servers.get(n)).length
+        // 官方的 cached / needs-auth 在 CCM 没有对应物，如实标注而不是假装有：
+        //   cached   官方会把 tools/list 结果落盘，进程没跑也能显示工具清单。
+        //            CCM 的 tools 只活在 serverState 上，进程不在就无从得知 → 判不出。
+        //   needs-auth 官方 MCP 支持 OAuth 授权流程（needs-auth 表示等用户授权）。
+        //            CCM 的 MCP 只支持 stdio 子进程，没有授权环节 → 这个状态不存在。
+        if (connectedCount < configured.filter(([, s]) => s?.disabled !== true).length) {
+          cannotShow.push(`${C.dim}cached / needs-auth 在 CCM 无对应状态（不缓存工具清单、无 OAuth 授权）${C.reset}`)
+        }
+        // 统计口径：「运行中」= 进程活着（connected + pending）。pending 的进程确实
+        // 在跑，只是没拿到工具，算进 running 才和上面逐条显示的状态自洽。
+        // 工具总数只来自 connected 的那些，所以两个数字不必相等，各自含义不同。
+        const running = configured.filter(([n, s]) => s?.disabled !== true && servers.get(n) && !servers.get(n).dead).length
         lines.push('')
-        lines.push(`${C.dim}共 ${configured.length} 个配置 · ${running} 个运行中 · 工具总数 ${mcpClient.getAllTools().length}${C.reset}`)
+        lines.push(`${C.dim}共 ${configured.length} 个配置 · ${running} 个进程在跑（其中 ${connectedCount} 个已连接） · 工具总数 ${mcpClient?.getAllTools?.().length ?? 0}${C.reset}`)
+        if (cannotShow.length) lines.push(...cannotShow)
         lines.push(`${C.dim}/mcp status 看工具清单 · /mcp enable|disable <名字> · 改动需重启生效${C.reset}`)
         return lines.join('\n')
       }
@@ -198,9 +324,106 @@ export function makeIntegrationCommands(ctx) {
           + picked.map(t => `  ${t.name}\n    ${String(t.description || '').slice(0, 90)}`).join('\n')
       }
 
+      // ── reconnect（对齐官方 2.1.303 的 `/mcp reconnect (<server>|all)`）──
+      //
+      // 【为什么需要】MCP 服务器是会挂的：子进程 OOM 被杀、stdio 管道断、
+      // 服务器内部崩溃但进程还在（于是 ping 有响应、tools/call 全超时）。
+      // 原来唯一的恢复手段是 Ctrl+X 重启整个 CLI —— 为了一个 server 断线
+      // 丢掉整轮对话状态，代价太高。官方 2.1.303 补了 reconnect 正是解决这个。
+      //
+      // 【为什么必须重新注册工具，而不只是重启进程】
+      // MCP 的工具是**启动时一次性**从 tools/list 拉下来、注册进 registry 的
+      // （见 index.mjs 的 mcpReady 那段）。重连后 tools/list 可能变了
+      // （服务器升级、配置改了 allowedTools），旧适配器就成了幽灵：
+      // 调用它 → callTool 找不到 server → 报错。所以这里要
+      //   1) 杀掉旧进程并从 servers 里摘掉
+      //   2) addServer 重新握手 + 拉工具清单
+      //   3) 用新清单替换 registry 里的同名适配器
+      // 第 3 步依赖 ctx.syncMcpTools —— 没有它就只能重连进程，
+      // 那样新工具要等下轮重启才可见，必须如实告诉用户。
+      if (sub === 'reconnect') {
+        const target = String(args[1] || '').trim()
+        if (!target) {
+          return `用法: /mcp reconnect <服务器名|all>\n可用: ${configured.map(([n]) => n).join(', ') || '(无)'}\n`
+            + '用途：服务器进程挂了/断线时重连，不必重启整个 CLI。'
+        }
+        const names = target.toLowerCase() === 'all'
+          ? configured.filter(([, s]) => s?.disabled !== true).map(([n]) => n)
+          : [target]
+        if (names.length === 0) return '没有需要重连的服务器（全部已禁用？）'
+
+        const results = []
+        for (const name of names) {
+          const srvCfg = cfg.mcpServers?.[name]
+          if (!srvCfg) { results.push(`  ${name}: 配置里没有这个服务器`); continue }
+          if (srvCfg.disabled === true) { results.push(`  ${name}: 已禁用，先 /mcp enable ${name}`); continue }
+          const before = mcpClient.servers.get(name)
+          const beforeTools = before?.tools?.length || 0
+          // 先停旧的（没在跑也无所谓）
+          if (before?.proc) { try { before.proc.kill() } catch {} }
+          mcpClient.servers.delete(name)
+          try {
+            const added = await mcpClient.addServer(name, srvCfg)
+            if (!added) { results.push(`  ${name}: 重连失败（进程起不来，看启动日志）`); continue }
+            const afterTools = added.tools?.length || 0
+            results.push(`  ${name}: 已重连 · 工具 ${beforeTools} → ${afterTools}`)
+          } catch (e) {
+            results.push(`  ${name}: 重连失败 — ${e?.message || e}`)
+          }
+        }
+        // 工具清单可能变了，让调用方把新工具同步进 registry
+        let syncNote = ''
+        try {
+          if (typeof ctx.syncMcpTools === 'function') {
+            const r = ctx.syncMcpTools()
+            syncNote = r ? `\n${r}` : ''
+          } else {
+            syncNote = '\n注：当前环境没有 registry 同步钩子，新工具要重启后才可见（进程已重连，旧工具照常可用）。'
+          }
+        } catch (e) {
+          syncNote = `\n注：同步工具清单失败（${e?.message || e}），按 Ctrl+X 重启后生效。`
+        }
+        return `MCP 重连结果：\n${results.join('\n')}${syncNote}`
+      }
+
       if (sub === 'enable' || sub === 'disable') {
         const target = String(args[1] || '').trim()
-        if (!target) return `用法: /mcp ${sub} <服务器名>\n可用: ${configured.map(([n]) => n).join(', ') || '(无)'}`
+        if (!target) return `用法: /mcp ${sub} <服务器名|all>\n可用: ${configured.map(([n]) => n).join(', ') || '(无)'}`
+
+        // ── all：一次处理全部（对齐官方 2.1.303 的 `<server>|all`）──
+        //
+        // 【为什么需要】禁用一批服务器时逐个敲要 N 条命令，而「临时全关掉
+        // 排查是不是 MCP 拖慢/搞崩」是高频操作。官方 2.1.303 明确支持 all。
+        //
+        // 【为什么写盘一次而不是循环调单条逻辑】循环写盘会在中途失败时留下
+        // 「一半禁用一半没动」的状态，而用户看到的是"操作完成"。这里先改内存
+        // cfg，最后一次性落盘 —— 要么全成，要么一个都不变。
+        if (target.toLowerCase() === 'all') {
+          const wantDisabled = sub === 'disable'
+          const changed = []
+          for (const [name, srv] of configured) {
+            const already = srv?.disabled === true
+            if (already === wantDisabled) continue
+            if (wantDisabled) cfg.mcpServers[name].disabled = true
+            else delete cfg.mcpServers[name].disabled
+            changed.push(name)
+          }
+          if (changed.length === 0) {
+            return `MCP: 全部 ${configured.length} 个服务器已经是${wantDisabled ? '禁用' : '启用'}状态`
+          }
+          try { writeMcpCfg(cfg) } catch (e) { return `写入 mcp.json 失败: ${e.message}（未做任何改动）` }
+          // 禁用能立即停进程；启用必须重启（见下方单条分支的说明）
+          if (wantDisabled) {
+            for (const name of changed) {
+              const live = mcpClient.servers.get(name)
+              if (live?.proc) { try { live.proc.kill() } catch {} }
+              mcpClient.servers.delete(name)
+            }
+            return `已禁用 ${changed.length} 个 MCP: ${changed.join(', ')}（进程已停止，工具下轮请求起不再可见）`
+          }
+          return `已启用 ${changed.length} 个 MCP: ${changed.join(', ')}，按 Ctrl+X 重启后生效`
+        }
+
         if (!cfg.mcpServers?.[target]) {
           return `没有名为 "${target}" 的 MCP 服务器\n可用: ${configured.map(([n]) => n).join(', ') || '(无)'}`
         }
@@ -223,12 +446,14 @@ export function makeIntegrationCommands(ctx) {
       }
 
       return `用法:\n`
-        + `  /mcp                看服务器列表与状态\n`
-        + `  /mcp status         同上，并列出每个服务器的工具名\n`
-        + `  /mcp tools [名字]   看工具详情（省略名字=全部）\n`
-        + `  /mcp enable <名字>  启用（需重启）\n`
-        + `  /mcp disable <名字> 禁用（立即停进程）\n`
-        + `配置文件: mcp.json`
+        + `  /mcp                      看服务器列表与状态\n`
+        + `  /mcp status               同上，并列出每个服务器的工具名\n`
+        + `  /mcp tools [名字]         看工具详情（省略名字=全部）\n`
+        + `  /mcp reconnect <名字|all> 重连（进程挂了/断线时用，不必重启 CLI）\n`
+        + `  /mcp enable <名字|all>    启用（需重启）\n`
+        + `  /mcp disable <名字|all>   禁用（立即停进程）\n`
+        + `配置文件: mcp.json\n`
+        + `注：enable/disable/reconnect 都接受 all（一次性处理全部已配置的服务器）。`
     },
 
     /**

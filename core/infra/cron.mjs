@@ -140,7 +140,54 @@ export function listCronTasks() {
   return [...file, ...sess]
 }
 
-export function addCronTask({ cron, prompt, recurring = false, durable = false }) {
+/**
+ * 新建定时任务。
+ *
+ * `recurring` 默认 **true**（对齐官方 CronCreate，claude.js:1005615 的
+ * `"true (default) = fire on every cron match until deleted or auto-expired"`）。
+ *
+ * 【为什么必须改默认值】CCM 原来默认 false，与官方相反。用户按官方语义
+ * 说「每天 9 点提醒我」，在 CCM 上只触发一次就消失 —— 这不是偏好差异，
+ * 是**用户按文档操作却得到相反结果**。一次性任务要显式传 recurring:false。
+ */
+/**
+ * 建一个定时任务。
+ *
+ * `atMs`（可选）：直接指定触发时刻（epoch ms），绕过 cron 表达式。
+ * 用途是 ScheduleWakeup —— Agent 说「20 分钟后叫醒我」，20 分钟后不是一个
+ * cron 能表达的东西（它要的是「现在 + 1200 秒」这个绝对时刻）。
+ * 传了 atMs 就忽略 cron 的解析与计算，任务本身仍是一次性的。
+ */
+export function addCronTask({ cron, prompt, recurring = true, durable = false, atMs = null }) {
+  // atMs 路径：不需要 cron 表达式，直接落一个绝对时刻
+  if (atMs !== null && atMs !== undefined) {
+    const when = Number(atMs)
+    if (!Number.isFinite(when) || when <= Date.now()) {
+      throw new Error('atMs 必须是未来的时间戳')
+    }
+    if (!prompt || !String(prompt).trim()) throw new Error('prompt 不能为空')
+    if (listCronTasks().length >= MAX_JOBS) throw new Error(`任务已满（${MAX_JOBS} 个），先删再建`)
+    const t = {
+      id: randomUUID().slice(0, 8),
+      // cron 留空：这类任务不参与 cron 重算，只按 nextFireAt 的绝对值触发一次
+      cron: '',
+      prompt: String(prompt),
+      createdAt: Date.now(),
+      recurring: false,
+      atMs: when,
+    }
+    if (durable) {
+      const file = readFile()
+      file.tasks.push(t)
+      writeFile(file.tasks)
+    } else {
+      sessionTasks.set(t.id, t)
+    }
+    // 预置下次触发时刻，让 cronCheck 第一轮就用它（不必等 cron 解析）
+    nextFireAt.set(t.id, when)
+    return { ...t, durable, nextRun: when, human: formatDelay(when - Date.now()) }
+  }
+
   if (!parseCronExpression(cron)) throw new Error(`cron 表达式非法: ${cron}`)
   if (!prompt || !String(prompt).trim()) throw new Error('prompt 不能为空')
   if (listCronTasks().length >= MAX_JOBS) throw new Error(`任务已满（${MAX_JOBS} 个），先删再建`)
@@ -154,6 +201,18 @@ export function addCronTask({ cron, prompt, recurring = false, durable = false }
     sessionTasks.set(t.id, t)
   }
   return { ...t, durable, nextRun: computeNextCronRun(t.cron), human: cronToHuman(t.cron) }
+}
+
+/** 把毫秒差说成人话：90 秒 → 「1 分 30 秒后」。 */
+function formatDelay(ms) {
+  const s = Math.max(1, Math.round(ms / 1000))
+  if (s < 60) return `${s} 秒后`
+  const m = Math.floor(s / 60)
+  const r = s % 60
+  if (m < 60) return r ? `${m} 分 ${r} 秒后` : `${m} 分钟后`
+  const h = Math.floor(m / 60)
+  const rm = m % 60
+  return rm ? `${h} 小时 ${rm} 分后` : `${h} 小时后`
 }
 
 export function deleteCronTask(id) {
@@ -232,6 +291,12 @@ export function missedOneShots(now = Date.now()) {
   const out = []
   for (const t of listCronTasks()) {
     if (t.recurring) continue
+    // atMs 型任务（ScheduleWakeup）没有 cron 表达式，按绝对时刻判断。
+    // 不处理的话 computeNextCronRun('') 会返回 null，这类任务永远进不了补跑通知。
+    if (t.atMs) {
+      if (t.atMs <= now) out.push(t)
+      continue
+    }
     const next = computeNextCronRun(t.cron, t.createdAt)
     if (next !== null && next <= now) out.push(t)
   }

@@ -5,10 +5,78 @@ import { resolveToolTimeout, describeTimeout } from '../infra/tool-timeout.mjs'
 import { describeFetchError, isTransportError } from '../infra/net-error.mjs'
 import { StreamArgsPreview, shouldPreviewArgs } from '../ui/stream-args.mjs'
 // 队友消息自动送达用。teams.mjs 不反向依赖 agent.mjs，无循环
-import { readInbox as teamReadInbox } from './teams.mjs'
+import {
+  readInbox as teamReadInbox,
+  sendMessage as teamSendMessage,
+  takeIdleSubscriptions as teamTakeIdleSubscriptions,
+} from './teams.mjs'
+// 跨进程会话消息（CLI ↔ Web）。sessions.mjs 只依赖 fs/path，无循环。
+import { readPeerInbox as peerReadInbox } from './sessions.mjs'
 // 【轮数上限单一真值源】静态导入安全：plan.mjs 只在函数体内动态 import agent.mjs，
 // 模块图中没有 agent → plan → agent 的静态环。
 import { NORMAL_MAX_TURNS, DEEP_MAX_TURNS } from './plan.mjs'
+// goal 状态只读（自动续轮的「有没有活动 goal」判据）。goal.mjs 只依赖 fs/path/atomic，
+// 不 import agent.mjs，无循环。
+import { snapshot as goalSnapshot } from './goal.mjs'
+
+/**
+ * 工具并发上限（对齐官方 2.1.303）。
+ *
+ * 官方 `fn57314()`（claude.js:672531）= `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY ?? 10`，
+ * 在 `fn61160` 里作为有界并发池的窗口大小。CCM 原来对一批只读工具
+ * 无条件 `Promise.all` 全量并发，没有上限 —— 模型一轮吐 20 个 Grep 就同时起 20 个。
+ *
+ * 手机上这不是理论问题：并发 Bash/Grep 各自 fork 进程 + 打开文件句柄，
+ * 峰值容易撞 EMFILE，而报错是每个工具各自的 EMFILE，看不出根因。
+ *
+ * 【为什么保留环境变量覆盖】与官方同名，方便用户在大任务时临时放宽；
+ * 非法值（NaN / ≤0）一律回落默认值，不让错误配置把并发打成 0（那样工具永不执行）。
+ */
+const MAX_TOOL_USE_CONCURRENCY = (() => {
+  const raw = Number.parseInt(process.env.CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY ?? '', 10)
+  return Number.isFinite(raw) && raw > 0 ? raw : 10
+})()
+
+/**
+ * 单条消息内所有 tool_result 的字符总量上限（对齐官方 2.1.303）。
+ *
+ * 官方 `num89 = 200000`（claude.js:100138，即 MAX_TOOL_RESULTS_PER_MESSAGE_CHARS），
+ * 在 run324 里对每条含 tool_result 的 user 消息做预算裁剪。
+ *
+ * 【和单结果上限（50000）的区别，别混】单结果上限是「一个工具的输出别太长」，
+ * 由 tools.mjs 的 truncateResult 管；这里管的是「一条消息里所有工具结果加起来」。
+ * 模型一轮并发调 5 个 Bash、每个返回 45k 都不超单结果上限，合起来 225k
+ * 却会一次吃掉大块上下文 —— 没有任何一层会拦，因为压缩阈值要到下一轮才判。
+ *
+ * 【为什么 200k 而不是更小】手机端上下文窗口常见 128k~1M token，
+ * 200k 字符 ≈ 50k token，占 128k 窗口的 40% —— 已经是「再大就该拒绝」的量级。
+ * 与官方同值，方便对照排查。
+ */
+const MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200000
+
+/**
+ * 主 Agent 到 maxTurns 上限时的自动续轮次数（对齐官方「默认不设上限」的手机端折中）。
+ *
+ * 【官方行为】claude.js 里主 Agent 没有硬轮数墙，靠用户 Ctrl+C 停。
+ * 手机端不能照抄：跑飞了用户手里可能在做别的事（QQ 桥、副屏都在用同一进程），
+ * 拦不住就是静默烧 token。
+ *
+ * 【为什么是 3 次而不是 1 次】1 次太少：一次续轮往往只够模型再收个尾，
+ *   而它刚被提醒过「自查是否空转」，通常还能干不少活。3 次是「够收尾 + 有界」的
+ *   平衡点，且与 Stop hook 的 3 次 block 上限同值（项目里已有的、被验证过的口径）。
+ *
+ * 【为什么必须有明确告知】自动续轮对用户不可见的话，他会以为任务已经结束，
+ * 而手机还在跑。所以每次续轮都注入一条系统消息，正文里带 N/3 计数和 Ctrl+C 提示。
+ *
+ * 【为什么只在没有活动 goal 时续】goal 模式有自己的预算和续轮驱动
+ *   （goal-runtime.mjs 在 agent.run 外层循环）。两个机制同时续 = 双重驱动，
+ *   预算形同虚设。所以有 active goal 时这里直接放弃，让 goal 自己管。
+ *
+ * 【计数何时清零】_run() 开头（每次用户发消息/子 Agent 接手都是一次新 run）。
+ *   不在 autoContinue 内部累加，是为了避免「同一次任务里续满 3 次后，
+ *   用户追问一句就永远不能再续」—— 追问是新任务，该有新的 3 次额度。
+ */
+const MAX_AUTO_CONTINUE = 3
 
 /**
  * 合并流式 tool_calls.arguments 分片。
@@ -62,8 +130,13 @@ function looksLikeCompleteJson(s) {
 }
 
 export class Agent {
-  constructor({ api, visionApi = null, systemPrompt, tools, maxTurns = NORMAL_MAX_TURNS, onText, onReasoning, onToolUse, onToolArgsPreview, onToolProgress, onToolResult, onError, onPermissionRequest, onTodoUpdate, onUsage, onTurnEnd, onTurnLimitApproaching, beforeToolCall = null, beforeApiRequest = null, logger, undoStore, useStream, pullSteering, traceEnabled = true, traceDir = null, traceParentRunId = null, streamWatchdogMs = 300000, cwd = null, sessionId = null }) {
+  constructor({ api, visionApi = null, systemPrompt, tools, maxTurns = NORMAL_MAX_TURNS, onText, onReasoning, onToolUse, onToolArgsPreview, onToolProgress, onToolResult, onError, onPermissionRequest, onTodoUpdate, onUsage, onTurnEnd, onTurnLimitApproaching, onAutoContinue, beforeToolCall = null, beforeApiRequest = null, logger, undoStore, useStream, pullSteering, traceEnabled = true, traceDir = null, traceParentRunId = null, streamWatchdogMs = 300000, cwd = null, sessionId = null, effortOverride = null }) {
     this.api = api
+    // 思考强度覆盖（子 Agent 专用）：null = 沿用 api 层的全局 /effort 设置。
+    // 由 SubAgentTool 的 effort 参数（lower/higher）换算成具体档位后写进来。
+    // 放在实例上而不是改 api.thinkingConfig —— api 可能是共享对象，改全局会把
+    // 主对话的强度一起带走。
+    this.effortOverride = effortOverride
     // 【让 api 层的内部重试进 trace】
     // api.request() 自己会按 maxRetries 重试，但 trace 里只有 agent 记的那一条
     // api_request —— 于是「60s×3+退避≈181s」在 trace 里看起来像"一次请求耗时181秒"，
@@ -98,6 +171,10 @@ export class Agent {
     // CLI 用它给用户显示提醒；模型侧另有「自查空转」的 hidden 消息（见 run 循环）
     // 既支持构造参数传入，也支持构造后赋值（plan.mjs 走后者）
     this.onTurnLimitApproaching = onTurnLimitApproaching || null
+    // 自动续轮时通知 UI（可选）。CLI/Web 接上就能像轮数提醒一样在终端里
+    // 打一条「已自动续轮（N/3）」。不接也不影响功能 —— 注入给模型的
+    // 系统消息里已经带同样的信息。
+    this.onAutoContinue = onAutoContinue || null
     // 每个 turn 结束时触发：(turnCount)。QQ 桥用它按 turn 分条发送回复。
     this.onTurnEnd = onTurnEnd || null
     // pullSteering: () => string[] — Web mid-turn steering。
@@ -182,6 +259,9 @@ export class Agent {
     this._lastUsedStream = false
     this._aborted = false
     this.watchMode = false  // 持续模式：开启后一轮结束不返回，注入"继续"循环直到关闭/打断
+    // ScheduleWakeup 用：置位后主循环在「本轮无工具调用」时结束，让进程释放。
+    // 与 watchMode 互斥（watch 想保持、它想退出），优先级见主循环里的注释。
+    this._wakeupScheduled = false
     this.traceEnabled = traceEnabled !== false
     this.traceDir = traceDir || undefined
     this.streamWatchdogMs = Math.max(1, Number(streamWatchdogMs) || 300000)
@@ -218,6 +298,10 @@ export class Agent {
       throw e
     } finally {
       this.isRunning = false
+      // 这一轮真的跑完了 → 本 Agent 现在算「空闲」，通知所有等我空闲的订阅者。
+      // 放在 isRunning=false 之后：通知里说的「已空闲」必须已经成立。
+      // 失败不影响主流程（通知是锦上添花，不能因为发不出去就报错）。
+      this._notifyIdleSubscribers()
       trace?.end({ status: traceStatus, turns: this.turnCount, message_count: this.messages.length })
       if (this._activeTrace === trace) this._activeTrace = null
     }
@@ -244,7 +328,7 @@ export class Agent {
     this.messages.push({ role: 'user', hidden: true, content })
   }
 
-  async _run(initialMessage, { signal, hidden = false } = {}) {
+  async _run(initialMessage, { signal, hidden = false, _autoContinue = false } = {}) {
     this.messages.push({ role: 'user', content: initialMessage, ...(hidden ? { hidden: true } : {}) })
     this.turnCount = 0
     // 指标按「一次 run」为单位重置 —— 状态条显示的是本次任务的耗时构成，
@@ -256,6 +340,14 @@ export class Agent {
     this._emptyRetries = 0
     this._maxOutputRetries = 0
     this._turnLimitWarned = false
+    // Stop hook 的 block 计数按 run 重置：hook 说"再处理一下"最多生效 3 次，
+    // 之后放行（否则 hook 写错一个条件就变成死循环，持续烧 token 且用户看不出原因）。
+    this._stopHookBlocks = 0
+    // 自动续轮计数只在**外部新 run**（用户发消息/子 Agent 接手）时重置。
+    // ⚠️ 续轮是内部的 _run 递归（_autoContinue:true），绝不能在这里清零 ——
+    // 否则每次续轮递归回来计数归零，3 次上限永远打不中，无限续轮
+    // （实测抓到过：maxTurns=2 的任务无限跑下去）。
+    if (!_autoContinue) this._autoContinues = 0
     const watchRun = this.watchMode
 
     // 持续模式不受单轮 maxTurns 限制；关闭后在下一轮安全收尾。
@@ -295,6 +387,10 @@ export class Agent {
       // 现在每轮开头自动把未读消息注入，Agent 不用管收信这件事。
       // 身份来自它自己调过的 TeamJoin（见 _noteTeamIdentity），没 join 过就不做事。
       this._deliverTeamMessages()
+      // 跨进程会话消息（CLI ↔ Web）走同一条注入路径 —— 也是「回合制下唯一
+      // 有意义的接收时机」。不接这一步的话，sessions.mjs 投出去的消息
+      // 永远躺在 inbox 文件里没人看。
+      this._deliverPeerMessages()
 
       // mid-turn steering：在下一轮模型调用前注入用户补充指令（不打断当前工具批次）
       if (this.pullSteering) {
@@ -360,6 +456,9 @@ export class Agent {
               messages: this._pruneOldImages(this.messages),
               tools: this.tools.map(t => t.toSchema()),
               signal,
+              // effortOverride 只在被显式指定时生效（子 Agent 由 Agent 工具
+              // 的 effort 参数写入）。null 时 api 层沿用全局 /effort 设置。
+              thinkingEffort: this.effortOverride || null,
             })
           }
           lastError = null
@@ -468,7 +567,28 @@ export class Agent {
         // 同理：写入量也用「第一个正值」
         const cacheWrite = [usage.cache_creation_input_tokens, usage.prompt_cache_write_tokens]
           .find((v) => typeof v === 'number' && v > 0) || 0
-        this.lastPromptTokens = promptTokens || this.lastPromptTokens
+        // ── 上下文总占用：两种协议的 usage 语义**相反**，不能一律相加 ──────────
+        //
+        // 【OpenAI 协议】prompt_tokens 是**全部输入**（已含命中缓存的部分），
+        //   prompt_tokens_details.cached_tokens 只是其中的子集。
+        //   → 再加一次 cacheRead 会重复计算，占用被高估。
+        //
+        // 【Anthropic 协议】usage 是 { input_tokens, cache_creation_input_tokens,
+        //   cache_read_input_tokens }，三者**互斥**：input_tokens 只是**未命中缓存的新增部分**，
+        //   命中缓存的部分（真实场景常占 80%+）完全不在里面。
+        //   → 必须加回 cacheRead + cacheWrite，否则占用严重低估。
+        //
+        // 【原来什么样（2026-10-20 修）】`usage.prompt_tokens ?? usage.input_tokens`
+        //   在 anthropic 下落到 input_tokens 就完事了，cache 只拿去展示、不进占用。
+        //   后果链：lastPromptTokens 偏低 → getContextWaterLevel 认为还有余量
+        //   → auto-compact 的 blocking 线永远不触发 → 真的撞上下文超长才报错。
+        //
+        // 【怎么区分】看有没有 prompt_tokens 这个字段 —— 有就是 OpenAI 语义（总输入），
+        //   没有、落到 input_tokens 就是 Anthropic 语义（仅新增部分）。
+        //   中转站同时返回两套字段时按 OpenAI 处理（它给了 prompt_tokens 就说明按那套语义）。
+        const hasOpenAiPromptTotal = typeof usage.prompt_tokens === 'number'
+        const contextTokens = hasOpenAiPromptTotal ? promptTokens : (promptTokens + cacheRead + cacheWrite)
+        this.lastPromptTokens = contextTokens || this.lastPromptTokens
         this._approxPromptTokens = false   // 真实值回来了，清掉估算标记
         this.lastUsage = { promptTokens:this.lastPromptTokens, completionTokens, cacheRead, cacheWrite }
         this.tokenUsage.output += completionTokens
@@ -680,12 +800,59 @@ export class Agent {
 
       if (tools.length === 0) {
         const text = am.content.find(b => b.type === 'text')?.text || ''
+        // 【ScheduleWakeup 优先于 watch】
+        //
+        // 两者语义冲突：watch 是「不结束，继续下一轮」，ScheduleWakeup 是
+        // 「结束本轮，到点再回来」。同时开着时，如果 watch 先 continue，
+        // 排定的唤醒虽然会触发，但进程根本没释放 —— 那就失去了这个工具
+        // 唯一的意义（省电、让出进程）。
+        //
+        // 所以这里先看有没有排定的唤醒：有就跳出循环，让本轮真正结束。
+        // `_wakeupScheduled` 由 ScheduleWakeup 工具设置，run 开始时清零。
+        if (this._wakeupScheduled) {
+          this._wakeupScheduled = false
+          break
+        }
         // 持续模式：不结束，注入"继续"让循环保持（用于盯队列/持续任务）
         if (this.watchMode) {
           // assistantMessage 已在上方写入历史，这里只追加下一轮 user 指令，
           // 避免每轮重复保存同一份 assistant 正文导致上下文/费用膨胀。
           this.messages.push({ role: 'user', hidden: true, content: '（持续模式：继续执行当前任务，如无新任务则保持监听，不要停止回复）' })
           continue
+        }
+        // Stop hook：agent 即将自然结束前的最后一道闸门（对齐官方）。
+        //
+        // 【为什么必须有触发点】hooks.mjs 从 2026 年起就声明支持 Stop、
+        // 也能解析 'BLOCK: 原因'，但全项目 `trigger('Stop')` **零调用** ——
+        // 声明和实现都在，唯独没人发这个事件，于是配置了 Stop hook 的用户
+        // 永远看不到它执行。这类"文档说有、代码不触发"的缺陷最难被用户描述清楚
+        // （他只会觉得"hook 没生效"）。
+        //
+        // 【触发条件】只在「真的要说完了」时触发：没有工具调用、不在持续模式、
+        // 不是子 agent（子 agent 有独立的 SubagentStop）、没有被打断。
+        // 返回 { block: true } 时按官方语义注入原因再跑一轮 —— 但**限次数**，
+        // 否则 hook 一直 block 会死循环烧 token。
+        if (this.hookManager && !this._isSubagentRun && !(signal && signal.aborted) && !this._aborted) {
+          if ((this._stopHookBlocks || 0) < 3) {
+            let stopResult = null
+            try {
+              stopResult = await this.hookManager.trigger('Stop', {
+                event: 'Stop',
+                reason: 'end_turn',
+                sessionId: this.sessionId || '',
+                output: String(text || '').slice(0, 4000),
+              })
+            } catch { /* hook 自身出错不能把正常结束变成失败 */ }
+            if (stopResult?.block && Array.isArray(stopResult.messages) && stopResult.messages.length > 0) {
+              this._stopHookBlocks = (this._stopHookBlocks || 0) + 1
+              this.messages.push({
+                role: 'user',
+                hidden: true,
+                content: `（Stop hook 阻止结束，原因如下 —— 这不是用户发言，是用户事先配置的检查规则：\n${stopResult.messages.join('\n')}\n请据此继续处理，处理完再结束。）`,
+              })
+              continue
+            }
+          }
         }
         return text
       }
@@ -721,7 +888,26 @@ export class Agent {
 
       // 先推 tool_result，再对 vision 结果追加多模态 user（图片走 image_url）
       const visionFollowups = []
-      const cleaned = allResults.map(r => {
+      // ── 单条消息的 tool_result 聚合预算（对齐官方 2.1.303）──────────
+      //
+      // 【为什么单结果上限不够】每个工具自己的 maxResultSizeChars 是 50k，
+      // 但一条 user 消息里可以塞 N 个 tool_result。模型一轮并发调 5 个 Bash、
+      // 每个都返回 45k 字符（都没超各自的单结果上限）→ 这条消息 225k 字符，
+      // 一次就吃掉上下文的一大块，而且**没有任何一层会拦**：
+      // 单结果检查放行了，压缩阈值要到下一轮才判，那时已经花掉一次完整请求的钱。
+      //
+      // 官方在 claude.js:100138 定义 `num89 = 200000`
+      // （MAX_TOOL_RESULTS_PER_MESSAGE_CHARS），在 run324 里对每条消息
+      // 做预算裁剪；超预算时按**结果体积降序**逐个淘汰（fn28130），
+      // 把最大的先压掉，直到总量回到预算内 —— 这样保留的是「多个小结果」
+      // 而不是「一个大结果」，信息密度更高。
+      //
+      // 【为什么在这里而不是 api.mjs】这里是 tool_result 进入历史的唯一收口，
+      // 所有路径（串行/并行/early-start/子 Agent）都经过；放在序列化出口的话
+      // 每次请求都要重算，而且历史里存着超长内容，压缩时还得再算一遍。
+      // 入历史前裁一次，后面所有环节都省事。
+      const budgeted = this._applyToolResultBudget(allResults)
+      const cleaned = budgeted.map(r => {
         if (r && r._vision) {
           const { _vision, ...rest } = r
           const parts = []
@@ -770,10 +956,62 @@ export class Agent {
     }
 
     if (watchRun) return ''
+    // 到轮数上限：先尝试自动续轮（有界），次数用尽才真的报错停下。
+    //
+    // 【为什么不是直接抛】官方主 Agent 没有硬轮数墙，到点继续跑由用户 Ctrl+C 停。
+    // 手机端不能照抄（跑飞了拦不住），但原来的「直接抛 + 让用户敲继续」也过于粗暴：
+    // 模型刚被提醒过自查空转，通常还剩收尾工作，一次续轮往往就够了。
+    // 折中：自动续，但最多 MAX_AUTO_CONTINUE 次，每次明确告知，Ctrl+C 随时可停。
+    if (this._canAutoContinue()) {
+      this._autoContinues++
+      this.messages.push({
+        role: 'user',
+        hidden: true,
+        content: `（系统提示：已达 maxTurns 上限（${this.maxTurns} 轮），已自动续轮（第 ${this._autoContinues}/${MAX_AUTO_CONTINUE} 次）。`
+          + `立刻收尾：把已完成的部分、还没做完的部分、卡在哪如实写清楚，不要无声中断，也不要为了省轮数交未验证的半成品。`
+          + `如果发现自己在原地打转，直接停下汇报。随时可以按 Ctrl+C 手动停止。`,
+      })
+      this._traceEmit('auto_continue', { turn: this.turnCount, count: this._autoContinues, max: MAX_AUTO_CONTINUE, max_turns: this.maxTurns })
+      try { this.onAutoContinue?.(this._autoContinues, MAX_AUTO_CONTINUE) } catch {}
+      return this._run(this._buildAutoContinueSeed(), { signal, hidden: true, _autoContinue: true })
+    }
     // 【消息要自解释】这条错误会经终端 / QQ / 图片等各条链路原样展示 ——
     // 旧的英文代号（'Max turns exceeded'）既看不懂，也不说怎么继续。
     throw new Error(`已达轮数上限（${this.maxTurns} 轮），停在中途；输入「继续」可接着做`
-      + (this.maxTurns < DEEP_MAX_TURNS ? `，或 /deep 把上限提到 ${DEEP_MAX_TURNS} 轮` : ''))
+      + (this.maxTurns < DEEP_MAX_TURNS ? `，或 /deep 把上限提到 ${DEEP_MAX_TURNS} 轮` : '')
+      + (this._autoContinues > 0 ? `（已自动续轮 ${this._autoContinues} 次，额度已用完）` : ''))
+  }
+
+  /**
+   * 这次能不能自动续轮。三个条件全部满足才续（任一不满足就报错停下）：
+   *   1. 额度没用完（_autoContinues < MAX_AUTO_CONTINUE）
+   *   2. 不是子 Agent（子 Agent 有 ExtendTurns 工具，自己管续轮；且它的
+   *      maxTurns 来自角色卡，父 Agent 不该越权改）
+   *   3. 当前没有活动 goal（goal 有自己的预算驱动，双重驱动会让预算失效）
+   *
+   * 【goal 状态怎么查】读 goal.mjs 的 snapshot(sessionId) —— 那是「消费方
+   * 唯一的数据来源」（goal.mjs 顶部纪律 A），isActive 字段即判据。
+   * sessionId 为空时按 'default' 算，与 tools-goal.mjs 的 resolveSid 一致。
+   */
+  _canAutoContinue() {
+    if (this._isSubagentRun) return false
+    if ((this._autoContinues || 0) >= MAX_AUTO_CONTINUE) return false
+    if (this.watchMode) return false
+    try {
+      const s = goalSnapshot(this.sessionId || 'default')
+      if (s && s.isActive) return false
+    } catch {}
+    return true
+  }
+
+  /**
+   * 续轮时的种子消息。用一条**极短**的 hidden user 消息而不是复述原始需求：
+   * 续轮的语义是「接着刚才的做」，历史里已经有全部上下文，再复述一遍
+   * 只会让模型以为用户提了新要求。
+   */
+  _buildAutoContinueSeed() {
+    return '（系统提示：继续上一轮未完成的工作。先看最近几轮的进展，直接接着做；'
+      + '如果发现没有实质可做的了，就如实收尾汇报。）'
   }
 
   /**
@@ -850,11 +1088,119 @@ export class Agent {
     }
   }
 
+  /**
+   * 并行执行一批 concurrencySafe 工具 —— **有界并发**。
+   *
+   * 【为什么不再直接 Promise.all（2026-10-19 对齐官方 2.1.303）】
+   * 原来是无条件全量并发：模型一轮吐出 N 个只读工具就同时起 N 个。
+   * 官方在同一处用 fn69762（claude.js:861501）做**有界并发池**，
+   * 上限 fn57314() = `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY ?? 10`。
+   * 手机上这个差别是实打实的：一轮并发 20 个 Grep/Bash 会瞬间拉满
+   * CPU 与文件句柄，最坏情况撞 fd 上限（EMFILE）导致整批失败，
+   * 而且失败信息是每个工具各自的 EMFILE，看不出根因是"并发太多"。
+   * 限到 10 之后：吞吐几乎无损失（都是 I/O 等待型），峰值资源可控。
+   *
+   * 【为什么不改成串行】串行会让"一次读 20 个文件"从 ~1 秒变成 ~20 秒。
+   * 有界池保留了并发收益，只削掉尾部尖峰。
+   *
+   * 【实现】滑动窗口：先填满 limit 个，之后每完成一个就补一个。
+   * 结果按 **原始下标** 回填，保证 tool_result 顺序与 tool_use 顺序一致
+   * （API 要求同一条 user 消息里 tool_result 与请求顺序对应；乱序会让
+   *  部分网关直接 400，或让模型把结果对错工具）。
+   */
   async _runToolsConcurrently(blocks, earlyPromises = new Map(), signal) {
-    return Promise.all(blocks.map(block => {
-      const early = earlyPromises.get(block.id) || null
-      return this._timedExecuteTool(block, early, signal)
-    }))
+    const limit = Math.max(1, MAX_TOOL_USE_CONCURRENCY)
+    // 未超限时走原路径：省掉调度开销，也保证行为与旧版完全一致
+    if (blocks.length <= limit) {
+      return Promise.all(blocks.map(block => {
+        const early = earlyPromises.get(block.id) || null
+        return this._timedExecuteTool(block, early, signal)
+      }))
+    }
+    const results = new Array(blocks.length)
+    let next = 0
+    const worker = async () => {
+      while (true) {
+        const i = next++
+        if (i >= blocks.length) return
+        const block = blocks[i]
+        const early = earlyPromises.get(block.id) || null
+        results[i] = await this._timedExecuteTool(block, early, signal)
+      }
+    }
+    await Promise.all(Array.from({ length: limit }, worker))
+    return results
+  }
+
+  /**
+   * 单条消息的 tool_result 聚合预算裁剪（对齐官方 run324 / fn28130）。
+   *
+   * 算法与官方一致：超预算时按结果体积**降序**排序，从最大的开始逐个
+   * 替换成占位提示，直到总量回到预算内。保留小结果、牺牲大结果 ——
+   * 因为大结果通常是「一坨日志/一整份文件」，模型可以重跑命令或 Read 再看，
+   * 而小结果是「退出码 0」「文件已写入」这类不可再生的一次性信号。
+   *
+   * 【与单结果截断的分工】tools.mjs 的 truncateResult 管「单个结果太长」
+   * （会落盘 + 保留头尾）；这里管「合起来太长」。两者都必要：
+   * 只有前者时 N 个中结果仍能撑爆一条消息，只有后者时单个超大结果
+   * 会独占整个预算把其它结果全挤掉。
+   *
+   * 【不改 vision 结果】带 `_vision` 的条目走多模态旁路，图片体积不由字符数
+   * 衡量，硬套字符预算会把截图整条误杀。这类直接跳过（与 tools.mjs 里
+   * 「结构化结果直接放行」同一原则）。
+   *
+   * @returns {Array} 裁剪后的结果数组（顺序不变，只替换超预算条目的 content）
+   */
+  _applyToolResultBudget(results) {
+    if (!Array.isArray(results) || results.length === 0) return results
+    const LIMIT = MAX_TOOL_RESULTS_PER_MESSAGE_CHARS
+    // 量体积：字符串按 length，对象按 JSON 序列化长度（与实际发出去的一致）
+    const sizeOf = (r) => {
+      if (r == null) return 0
+      const c = r.content
+      if (typeof c === 'string') return c.length
+      if (c == null) return 0
+      try { return JSON.stringify(c).length } catch { return 0 }
+    }
+    let total = 0
+    const sizes = results.map(r => {
+      const n = sizeOf(r)
+      total += n
+      return n
+    })
+    if (total <= LIMIT) return results
+
+    // 按体积降序决定淘汰顺序；vision 条目与错误结果不参与淘汰。
+    //
+    // 【为什么不淘汰 is_error 的】错误信息通常很短（几十到几百字符），
+    // 淘汰它们几乎不省预算，却会让模型失去「刚才那个工具失败了」的关键事实 ——
+    // 它很可能据此重试或改变策略，删掉就变成闷头乱撞。
+    const order = results
+      .map((r, i) => ({ i, size: sizes[i] }))
+      .filter(({ i, size }) => size > 0
+        && !(results[i] && results[i]._vision)
+        && !(results[i] && results[i].is_error))
+      .sort((a, b) => b.size - a.size)
+
+    const dropped = []
+    const out = results.slice()
+    for (const { i, size } of order) {
+      if (total <= LIMIT) break
+      const note = `[此工具结果因本条消息的工具输出总量超出 ${LIMIT} 字符预算被省略（原 ${size} 字符）。`
+        + `需要该内容请重新执行这个工具，或缩小它的输出范围。]`
+      out[i] = { ...results[i], content: note }
+      total -= size - note.length
+      dropped.push({ i, size })
+    }
+    if (dropped.length) {
+      this._traceEmit('tool_result_budget', {
+        turn: this.turnCount,
+        limit: LIMIT,
+        droppedCount: dropped.length,
+        droppedChars: dropped.reduce((a, d) => a + d.size, 0),
+      })
+    }
+    return out
   }
 
   async _runToolsSerially(blocks, earlyPromises = new Map(), signal) {
@@ -910,6 +1256,101 @@ export class Agent {
     } catch {}
   }
 
+  /**
+   * 跨进程会话消息自动送达（CLI ↔ Web）。
+   *
+   * 与 _deliverTeamMessages 同一个注入点、同一条理由：Agent 是回合制的，
+   * 只有「下一轮开始前」这个时刻能接收。区别只是数据源不同 ——
+   * 团队消息来自 teams/ 的 inbox，这里来自 peer-inbox/ 的文件队列。
+   *
+   * 投递权限（crossSessionInbound）在**发送端**判定（发送端知道自己的
+   * 权限模式）；接收端只负责读。被 hold 的消息根本不会写进这个 inbox，
+   * 所以这里读到的都是已经过策略的。
+   */
+  _deliverPeerMessages() {
+    try {
+      const unread = peerReadInbox({ sessionId: this.sessionId }) || []
+      if (!unread.length) return
+      const lines = unread.map(m => {
+        const who = m.from || `pid:${m.fromPid || '?'}`
+        const sum = m.summary ? `（${m.summary}）` : ''
+        return `【来自会话 ${who}${sum}】\n${String(m.text ?? '')}`
+      })
+      this.messages.push({
+        role: 'user',
+        content: `（跨会话消息 · ${unread.length} 条自动送达）\n\n${lines.join('\n\n')}`,
+      })
+    } catch {}
+  }
+
+  /**
+   * 本 Agent 空闲了 → 给「等我空闲」的订阅者发通知。
+   *
+   * notify_when_idle 的最后一环。整条链路：
+   *   SendMessage(notify_when_idle:true) → teams.subscribeIdle 登记订阅
+   *   → 我这一轮跑完 → 这里取出订阅 → 往订阅者的 inbox 投一条「我空闲了」
+   *
+   * 只在**这一轮真的跑完**时调（不是每轮中间），因为「空闲」的定义就是
+   * 「当前这轮结束了、下一轮还没开始」。放在 run 的收尾处。
+   */
+  _notifyIdleSubscribers() {
+    if (!this._teamIds?.length) return
+    try {
+      for (const { team, agent } of this._teamIds) {
+        const subs = teamTakeIdleSubscriptions(team, agent)
+        for (const s of subs) {
+          // 通知走同一条 sendMessage 通道（不传 notifyWhenIdle，避免递归订阅）
+          teamSendMessage(team, {
+            from: agent,
+            to: s.watcher,
+            text: `[${agent}] 已空闲（这一轮跑完了）。你之前发的消息${s.msgId ? `（${s.msgId}）` : ''}它现在能看到了。`,
+            summary: `${agent} 已空闲`,
+            type: 'idle_notice',
+          })
+        }
+      }
+    } catch {}
+  }
+
+  /**
+   * 触发 PermissionDenied hook（对齐官方独立事件）。
+   *
+   * 【schema】tool_name / tool_input / tool_use_id / reason / mcp_server?
+   * 两条调用路径：权限判定拒绝（onPermissionRequest 返回 false）、
+   * PreToolUse hook deny。
+   *
+   * 【为什么 hook 失败绝不影响拒绝本身】hook 是观察者 —— 用户配的
+   * 「被拒时通知我」挂了他也已经知道被拒了；反过来若因为 hook 崩就放行
+   * 工具，等于把安全边界交给一个第三方脚本，那才是真漏洞。
+   * 所以整段 try/catch，且**不把 hook 返回值用于任何决策**（观察类事件）。
+   */
+  async _firePermissionDenied(block, reason) {
+    if (!this.hookManager) return
+    try {
+      // 【两套字段名并存】官方 schema 是 snake_case（tool_name/tool_input/tool_use_id）；
+      // 但 hooks.mjs 的 _runHook 组 env 时读的是通用键（tool/input/toolUseId），
+      // 它对所有事件统一处理、不会为 PermissionDenied 特判。少传任何一个，
+      // hook 脚本收到的 TOOL_NAME / TOOL_INPUT / TOOL_USE_ID 就是空串。
+      await this.hookManager.trigger('PermissionDenied', {
+        event: 'PermissionDenied',
+        // 官方 schema（snake_case）
+        tool_name: block.name,
+        tool_input: block.input,
+        tool_use_id: block.id,
+        reason: String(reason || 'denied'),
+        // hooks.mjs 的 env 构造读取的通用键
+        tool: block.name,
+        input: block.input,
+        toolUseId: block.id,
+        ...(block.name && this.tools?.find?.(t => t?.name === block.name)?.mcpServer
+          ? { mcp_server: this.tools.find(t => t?.name === block.name).mcpServer }
+          : {}),
+      })
+    } catch (hookError) {
+      this.logger.warn?.(`[Hook] PermissionDenied failed: ${hookError.message}`)
+    }
+  }
+
   async _executeTool(block, earlyPromise, signal, opts = {}) {
     // 工具调用前的检查点（上下文自动压缩等）。
     // 放在最前：压缩要改历史，越早做越安全（工具还没跑，没有半途状态）。
@@ -937,7 +1378,9 @@ export class Agent {
     if (block.name === 'TeamJoin') this._noteTeamIdentity(block.input)
     this._traceEmit('tool_start', { turn: this.turnCount, tool: block.name, tool_use_id: block.id, input: block.input })
     if (!tool) {
-      const message = `Tool "${block.name}" not found`
+      // 引导 ToolSearch：低频工具默认延迟加载（schema 只发占位），
+      // 模型看不到参数就直接猜名字调用会落到这里。告诉它检索一下就能拿到完整 schema。
+      const message = `Tool "${block.name}" not found。如果是低频工具，它的参数说明默认延迟加载 —— 先调 ToolSearch（query 关键词或 select:["${block.name}"]）取回完整 schema 再调用；若 ToolSearch 也查不到，才是真的没有这个工具。`
       this._traceEmit('tool_error', { turn: this.turnCount, tool: block.name, tool_use_id: block.id, error: 'tool not found' })
       try { this.onToolResult(null, block, message, { error: true }) } catch {}
       return { type: 'tool_result', tool_use_id: block.id, content: message, is_error: true }
@@ -950,6 +1393,7 @@ export class Agent {
       if (hookResult?.deny) {
         const message = `Blocked by hook: ${hookResult.message}`
         this._traceEmit('tool_error', { turn: this.turnCount, tool: block.name, tool_use_id: block.id, error: `hook denied: ${hookResult.message}` })
+        await this._firePermissionDenied(block, hookResult.message || 'Hook denied')
         try { this.onToolResult(tool, block, message, { error: true }) } catch {}
         return { type: 'tool_result', tool_use_id: block.id, content: message, is_error: true }
       }
@@ -967,6 +1411,7 @@ export class Agent {
     if (!allowed) {
       const message = 'Denied'
       this._traceEmit('tool_error', { turn: this.turnCount, tool: block.name, tool_use_id: block.id, error: 'permission denied' })
+      await this._firePermissionDenied(block, 'permission denied')
       try { this.onToolResult(tool, block, message, { error: true, denied: true }) } catch {}
       return { type: 'tool_result', tool_use_id: block.id, content: message, is_error: true }
     }
@@ -1032,14 +1477,29 @@ export class Agent {
       const declaredOk = (result && typeof result === 'object' && '__ok' in result) ? !!result.__ok : undefined
       this.onToolResult(tool, block, result, declaredOk === undefined ? {} : { error: !declaredOk, ok: declaredOk, exitCode: result.__exitCode })
       this._traceEmit('tool_result', { turn: this.turnCount, tool: block.name, tool_use_id: block.id, ok: declaredOk !== false, result: tracePreview(result, 500) })
-      // PostToolUse hook
+      // PostToolUse / PostToolUseFailure hook
+      //
+      // 【为什么拆成两个事件（对齐官方 2.1.303）】官方 hooks 事件表里
+      // PostToolUse 与 PostToolUseFailure 是两个独立事件（共 33 个事件）。
+      // CCM 原来只有 PostToolUse，且**成功和失败都走它** —— hook 脚本只能
+      // 自己去嗅 output 里有没有 error 字样，而那个启发式是错的：
+      // `grep` 没匹配到返回 exit 1、`ls` 列出的文件名叫 error.log，
+      // 都会被误判成失败。用工具声明的 __ok（Bash 用真实 exitCode）才准。
+      //
+      // 拆开的好处：失败 hook 可以单独配「失败就通知/回滚/打日志」，
+      // 不用在每个 hook 里写 if 判断；成功路径也不会被失败逻辑拖慢。
+      //
+      // 【判定口径】declaredOk === false 才算失败。undefined（工具没声明）
+      // 一律按成功走 —— 与项目既有约定一致：显式 false 才算失败。
       if (this.hookManager) {
+        const hookEvent = declaredOk === false ? 'PostToolUseFailure' : 'PostToolUse'
         try {
-          await this.hookManager.trigger('PostToolUse', {
-            event: 'PostToolUse', tool: block.name, input: block.input, output: result
+          await this.hookManager.trigger(hookEvent, {
+            event: hookEvent, tool: block.name, input: block.input, output: result,
+            ...(declaredOk === false ? { error: true, exitCode: result?.__exitCode } : {}),
           })
         } catch (hookError) {
-          this.logger.warn?.(`[Hook] PostToolUse failed: ${hookError.message}`)
+          this.logger.warn?.(`[Hook] ${hookEvent} failed: ${hookError.message}`)
         }
       }
       // 识图工具：返回 {__type:'vision', text, images[]} → tool_result 文本 + 旁路多模态 user 消息
@@ -1062,6 +1522,19 @@ export class Agent {
       const message = `Error: ${e.message}`
       this._traceEmit('tool_error', { turn: this.turnCount, tool: block.name, tool_use_id: block.id, error: e?.message || String(e) })
       try { this.onToolResult(tool, block, message, { error: true, exception: e }) } catch {}
+      // 工具抛异常也是失败 → 同样要触发 PostToolUseFailure。
+      // 上面那条正常路径的判定只看 declaredOk，异常根本走不到那儿，
+      // 少了这里的话「工具直接崩了」这种最该被 hook 知道的失败反而漏掉。
+      if (this.hookManager) {
+        try {
+          await this.hookManager.trigger('PostToolUseFailure', {
+            event: 'PostToolUseFailure', tool: block.name, input: block.input,
+            output: message, error: true, exception: e?.message || String(e),
+          })
+        } catch (hookError) {
+          this.logger.warn?.(`[Hook] PostToolUseFailure failed: ${hookError.message}`)
+        }
+      }
       return { type: 'tool_result', tool_use_id: block.id, content: message, is_error: true }
     } finally {
       clearTimeout(timeoutTimer)
@@ -1212,6 +1685,8 @@ export class Agent {
       messages: messagesForApi,
       tools: this.tools.map(t => t.toSchema()),
       signal: streamSignal,
+      // 与 createMessage 那条路径保持一致：子 Agent 可被单独指定思考强度。
+      thinkingEffort: this.effortOverride || null,
     })
     let content = ''
     let reasoning = ''  // GLM-5.2 思考内容（独立累加，不入 messages 历史）
@@ -1644,6 +2119,17 @@ export class Agent {
   // 声明式异常重试表（Aider ExInfo 风格）：name / retry / description
   // 命中规则按顺序匹配，返回 { retry, description }
   _classifyError(e) {
+    // ── 额度耗尽的特征（2026-10-23 从 rate_limit 里拆出来）──
+    // 判据与 core/api/key-pool.mjs 的 KEY_EXHAUSTED_PATTERNS 同源，但只取
+    // "余额/额度"那一类：key 本身失效（invalid_api_key 等）归 auth_key
+    // 走 401/403 分支，不在这里重复。
+    const INSUFFICIENT_QUOTA_RE = /insufficient[_\s-]?(?:user[_\s-]?)?quota|pre_consume_token_quota_failed|quota\s+is\s+not\s+enough|exceeded?\s+your\s+current\s+quota|quota[_\s-]?(?:exceeded|exhausted)|insufficient[_\s-]?balance|balance\s+is\s+insufficient|余额(?:不足|为负|已用完)|额度(?:不足|已用完|耗尽)|欠费|请充值|out\s+of\s+credit|no\s+credit/i
+    // 同一段文本里出现这些字样时按限流处理 —— 宁可多等一轮，
+    // 也不要把"限流"误判成"没钱"（后者会直接放弃重试）。
+    // ⚠️ 文案要与 key-pool.mjs 的 NOT_KEY_FAULT_PATTERNS 对齐：
+    //    那里多了 TPM/RPM 上限、参数错误等。这里只取限流子集即可 ——
+    //    其余情况本来也匹配不上 INSUFFICIENT_QUOTA_RE。
+    const RATE_LIMIT_HINT_RE = /rate[_\s-]?limit|too\s+many\s+requests|请求(?:过于)?频繁|速率限制|限流/i
     // 【2026-10-16 改】把 cause 链并进待匹配文本。
     //
     // 原来只有 `e.message`。而 Node fetch 传输层失败时 message **恒为
@@ -1683,6 +2169,15 @@ export class Agent {
       // 区别是那条靠错误文本匹配，这条靠 api 层显式打的标记，更可靠。
       if (e?.retriesExhausted) {
         return { retry: false, description: '下层已重试穷尽，不再叠加', name: 'retries_exhausted' }
+      }
+      // 429 / 402 都可能是「这个 key 没钱了」而不是「被打太频」。
+      // OpenAI 的 insufficient_quota 就是 429 + body 里带 type=insufficient_quota；
+      // DeepSeek 用 402 专表余额不足。
+      // 换 key 由 api.mjs:2234 的 isKeyExhaustedError 负责（它在 429 分支
+      // **之前**，所以能轮换而不是干等）；走到这里代表那一层已经轮换/重试
+      // 穷尽 —— 再判 retry:true 就是拿同一个没钱的 key 白等 15 秒。
+      if ((code === 429 || code === 402) && INSUFFICIENT_QUOTA_RE.test(msg) && !RATE_LIMIT_HINT_RE.test(msg)) {
+        return { retry: false, description: 'API key 额度/余额耗尽（换 key 请见 api 层轮换结果），不再重试', name: 'insufficient_quota' }
       }
       if (code === 429) return { retry: true, description: '限流，可重试', name: 'rate_limit' }
       if (code >= 500 && code <= 599) return { retry: true, description: '服务端错误，可重试', name: 'server_5xx' }
@@ -1742,7 +2237,29 @@ export class Agent {
       // 这是连接问题、换条连接可能就好，且 api 内层已重试过 → 交给上层换 key/报错。
       { name: 'transport_abort', re: /Request aborted by transport/i, retry: false, desc: '传输层中断（api 内部已重试）' },
       { name: 'network', re: /ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up|network error|fetch failed|ENOTFOUND|EAI_AGAIN|network/i, retry: true, desc: '网络错误，可重试' },
-      { name: 'rate_limit', re: /\b429\b|rate limit|quota/i, retry: true, desc: '限流，可重试' },
+      // 额度耗尽（2026-10-23 从 rate_limit 拆出）。
+      // 判据与 core/api/key-pool.mjs 的 KEY_EXHAUSTED_PATTERNS 同源，只取
+      // "余额/额度"那一类；key 本身失效（invalid_api_key 等）走上面的 auth_key。
+      //
+      // 【为什么 retry:false】api.mjs 的 isKeyExhaustedError 分支排在 429
+      // 分支**之前**（api.mjs:2234），所以能换 key 的时候已经换过了；
+      // 错误冒到这里代表池里没有能用的 key。此时 agent 层再 retry 4 轮，
+      // 是拿同一个没钱的 key 干等 15 秒拿同一个错 —— 那正是本拆分类要治的。
+      //
+      // ⚠️ 必须排在 rate_limit 之前，且带 `not` 守卫：下面那条的正则里
+      // 原本也有 quota 字样，单靠顺序分不清 "rate limit ... quota"。
+      {
+        name: 'insufficient_quota',
+        re: /insufficient[_\s-]?(?:user[_\s-]?)?quota|pre_consume_token_quota_failed|quota\s+is\s+not\s+enough|exceeded?\s+your\s+current\s+quota|quota[_\s-]?(?:exceeded|exhausted)|insufficient[_\s-]?balance|balance\s+is\s+insufficient|余额(?:不足|为负|已用完)|额度(?:不足|已用完|耗尽)|欠费|请充值|out\s+of\s+credit|no\s+credit/i,
+        not: RATE_LIMIT_HINT_RE,
+        retry: false,
+        desc: 'API key 额度/余额耗尽，重试无意义（换 key 由 api 层轮换，见 key_rotated 事件）',
+      },
+      // `too\s+many\s+requests` 一起补上：上面的 insufficient_quota 用
+      // RATE_LIMIT_HINT_RE 做否决守卫，而该守卫认这个字样 —— 不加的话
+      // 「too many requests + quota 字样」的混合文本会被守卫挡掉 quota
+      // 分类，又没人认它，最后落 unknown（retry:false，直接报错）。
+      { name: 'rate_limit', re: /\b429\b|rate limit|too\s+many\s+requests|限流/i, retry: true, desc: '限流，可重试' },
       // 没有 HTTP 前缀时才用这些文本特征兜底（去掉了裸的 \b5\d\d\b）
       { name: 'server_5xx', re: /SERVICE_BUSY|LITELLM_UNAVAILABLE|upstream_unavailable|bad\s+gateway|service\s+unavailable|internal\s+server\s+error/i, retry: true, desc: '服务端错误，可重试' },
       // 中转站（new_api 等）的瞬时抖动不带 HTTP 前缀，纯文案特征：
@@ -1758,6 +2275,9 @@ export class Agent {
       { name: 'abort', re: /terminated/i, retry: true, desc: '连接被终止，可重试' },
     ]
     for (const row of table) {
+      // `not`：这条规则的否决条件。用来把「限流文案里带了 quota 字样」
+      // 和「真的没钱了」分开 —— 前者该等，后者该换 key/直接报错。
+      if (row.not && row.not.test(msg)) continue
       if (row.re.test(msg)) return { retry: row.retry, description: row.desc, name: row.name }
     }
     return { retry: false, description: '未知错误，不重试', name: 'unknown' }

@@ -1,8 +1,15 @@
 // 多 Agent 协作与任务命令（handleCommand 拆分第十五批）
 //
-// /team   团队全景（成员、任务数、未读消息）
-// /tasks  持久化待办清单
-// /away   离场报告（不在场时发生了什么）
+// /team      团队全景（成员、任务数、未读消息）
+// /tasklist  持久化任务清单（TaskCreate 建的那些，跨重启存活）
+// /away      离场报告（不在场时发生了什么）
+//
+// 【2026-10-22 改名】持久待办原来是 /tasks，与官方语义冲突：
+// 官方 /tasks（aliases: ["bashes"]）管的是**后台进程**（"View and manage
+// everything running in the background"），而这里管的是「要做的事」。
+// 两者都叫 tasks 会让「/tasks 看看后台跑着什么」落空。
+// 现在 /tasks 对齐官方（见 index.mjs 的 case），本命令改叫 /tasklist。
+// 为什么不叫 /todos：/todos 已被轮内 TodoWrite 清单占用（cmd-queries.mjs）。
 //
 // 这三个都是零外层 let 写回 —— 纯读取 + 打印，是最容易拆的一类。
 // 相比之下 /resume 要写回 4 个外层 let（sessionId/sessionTitle/todos/incognitoMode），
@@ -26,7 +33,7 @@ import { formatTasks, TASK_DEFAULT_LIST } from '../agent/tasks.mjs'
 export function makeTeamTaskCommands(ctx) {
   return {
     team(args) {
-        // 多 Agent 协作的观察窗口。团队名 = 任务列表名，所以 /team X 和 /tasks X 看的是同一批活。
+        // 多 Agent 协作的观察窗口。团队名 = 任务列表名，所以 /team X 和 /tasklist X 看的是同一批活。
         const sub = (args[0] || '').toLowerCase()
         if (!sub || sub === 'list') {
           const all = ctx.listTeams()
@@ -46,12 +53,12 @@ export function makeTeamTaskCommands(ctx) {
         }
         const ov = ctx.teamOverview(sub)
         if (!ov) return `团队 [${sub}] 不存在。/team 看全部`
-        return ctx.formatTeamOverview(ov) + `\n\n任务明细用 /tasks ${sub}`
+        return ctx.formatTeamOverview(ov) + `\n\n任务明细用 /tasklist ${sub}`
     },
 
-    tasks(args) {
-        // 持久化 Task 的查看入口。跟 /bg-list 不是一回事：
-        // bg-list 是「正在跑的进程」，tasks 是「要做的事」（跨重启存活）。
+    tasklist(args) {
+        // 持久化 Task 的查看入口。跟 /tasks 不是一回事：
+        // /tasks 是「正在跑的进程」，这里是「要做的事」（跨重启存活）。
         const sub = (args[0] || '').toLowerCase()
         const listId = args[1] || TASK_DEFAULT_LIST
         if (sub === 'clear') {
@@ -68,7 +75,7 @@ export function makeTeamTaskCommands(ctx) {
         const doing = tasks.filter(t => t.status === 'in_progress').length
         return `任务列表 [${target}] 共 ${tasks.length} 条（进行中 ${doing} · 已完成 ${done}）\n` +
           `${formatTasks(tasks)}\n\n` +
-          `用法: /tasks [列表名] · /tasks lists 看所有列表 · /tasks clear [列表名] 清空`
+          `用法: /tasklist [列表名] · /tasklist lists 看所有列表 · /tasklist clear [列表名] 清空`
     },
 
     away(args) {

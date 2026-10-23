@@ -13,9 +13,8 @@ const NO_TOOLS_PREAMBLE = `CRITICAL: Respond with TEXT ONLY. Do NOT call any too
 
 `
 
-// 摘要硬限额导出：提示词直接引用这里，避免文档与实现漂移
-// （历史上提示词长期写着已作废的“1800 字 / maxTokens 500”）
-export const SUMMARY_CHAR_LIMIT = 16000     // 单个摘要正文上限（字符）
+// 摘要正文不再有字符上限（2026-10-21 取消 SUMMARY_CHAR_LIMIT = 16000）。
+// 历史上这个值被 _truncateSummary 用来「超长保尾部」，会把九段结构的前半段砍掉。
 // 摘要输出预算（含上游计入输出的思考 token）。
 //
 // 演化史（别只看数字）：
@@ -25,11 +24,26 @@ export const SUMMARY_CHAR_LIMIT = 16000     // 单个摘要正文上限（字符
 //   131072 → 用户下调
 //   65536  → 当前值（用户 2026-09-18 指定）
 //
-// 思考档位：摘要请求固定 medium（见 summarizeMessages 的 thinkingEffort），
+// 思考档位：摘要请求固定 'none'（关闭）。见 summarizeMessages 里的实测数据：
+// 同一输入 effort=max 输出 402 字符、medium 215 字符、none 23359 字符 ——
+// 开思考会把输出预算烧在 reasoning 上，正文只剩几百字符。
 // 双保险 —— 预算放宽 + 思考档位收敛，比单纯堆 max_tokens 稳。
 // 配置了 provider.maxOutputTokens 时，API 层仍会进一步夹取。
 export const SUMMARY_MAX_TOKENS = 65536
-export const SUMMARY_INPUT_CHAR_LIMIT = 60000 // 送去摘要的文本墙上限（字符）
+// 【2026-10-20 取消输入截断】
+//
+// 原来这里是 60000 字符的硬上限，超了用 `.slice(0, LIMIT)` —— **从开头截**。
+// 后果是「保留最老的、丢掉最新的」，正好反了：
+//   实测一次 /compact 200：完整文本 421260 字符，只送了前 199 条消息（共 1786 条），
+//   占 11%。而当天下午做的 claude.js 调研在第 852 条之后 → 一个字都没进摘要，
+//   摘要里连「claude.js」这个词都不存在。用户当场发现「你好像完全不知道 claude.js」。
+//
+// 现在完全不截断，整段送给摘要模型。代价是输入变长（由模型的上下文窗口兜底），
+// 收益是摘要不再系统性丢失近期工作。
+//
+// 注意：原来这里还有一个 SUMMARY_INPUT_CHAR_LIMIT = 60000 的导出，
+// 2026-10-20 连同截断逻辑一起删掉了（prompts.mjs 的 {{SUMMARY_INPUT_LIMIT}} 插值也已移除）。
+// 别再把它加回来 —— 它存在时只做一件事：把最新工作挡在摘要之外。
 
 const SEGMENT_RE = /^\[缓存摘要段\s+(\d+)\]/
 const LEGACY_RE = /^\[历史摘要\]/
@@ -256,9 +270,15 @@ export class CompactService {
       }
     }
 
-    // 摘要不再狠砍到 1800 字符（官方预留 20K token 给摘要输出）。16K 字符 ≈ 4-8K tokens，
-    // 足够容纳九段结构 + 文件路径 + 关键代码引用；超出部分按段落边界截断保尾部。
-    let trimmed = this._truncateSummary(this._formatSummary(String(summary)), SUMMARY_CHAR_LIMIT)
+    // 【2026-10-21 摘要不截断】
+    //
+    // 原来这里过 _truncateSummary(..., 16000)，超长就「按段落边界截断保尾部」。
+    // 后果是长摘要的前半段（Primary Request / Key Concepts / Files）被砍掉，
+    // 只留最后的 Current Work —— 而那几段恰恰是后续工作最需要的背景。
+    // 实测一次 /compact 生成 23000+ 字符，被砍到 16000，丢了约 1/3。
+    // 摘要本身就是「历史信息的浓缩」，再截一次等于二次有损压缩，没有理由。
+    // 现在原样保留完整摘要（token 成本由压缩本身已经换取，不该在这里省）。
+    let trimmed = this._formatSummary(String(summary))
 
     // compact 差集重注入：列出被摘要的消息里通过 Read/Grep/Glob 等读过的文件路径。
     // 压缩后模型引用这些路径时直接引摘要中的内容，不重复 Read。
@@ -307,19 +327,6 @@ export class CompactService {
     return s.trim()
   }
 
-  // 超长时按段落边界截断保尾部（保留最后的"当前工作/下一步"信息，牺牲前部细节）
-  _truncateSummary(text, maxChars) {
-    if (text.length <= maxChars) return text
-    const paras = text.split('\n\n')
-    let out = []
-    let len = 0
-    for (let i = paras.length - 1; i >= 0; i--) {
-      if (len + paras[i].length > maxChars && out.length) break
-      out.unshift(paras[i])
-      len += paras[i].length + 2
-    }
-    return `[摘要超长已截断，保留尾部]\n\n` + out.join('\n\n')
-  }
 
   _estimateTokens(messages) { return Math.ceil(JSON.stringify(messages || []).length / 4) }
 
@@ -357,12 +364,18 @@ export class CompactService {
       if (typeof m.content === 'string') return `${role}: ${m.content}`
       if (Array.isArray(m.content)) return `${role}: ` + m.content.map(b => {
         if (b.type === 'text') return b.text
-        if (b.type === 'tool_use') return `[调用工具: ${b.name}(${JSON.stringify(b.input).slice(0,200)})]`
-        if (b.type === 'tool_result') return `[工具结果${b.is_error?'(错误)':''}: ${String(b.content).slice(0,240)}]`
+        // 【工具调用参数与结果同样不截断】
+        //
+        // 原来这里各砍一刀（参数 200、结果 240 字符）。对「读代码」类工作这是致命的：
+        // 一条 `sed -n '1572150,1572200p' claude.js` 的输出约 3000 字符，
+        // 砍到 240 只剩一行开头 —— 摘要模型根本看不到查到了什么，
+        // 于是「今天调研过 claude.js」这件事在摘要里彻底消失。
+        if (b.type === 'tool_use') return `[调用工具: ${b.name}(${JSON.stringify(b.input)})]`
+        if (b.type === 'tool_result') return `[工具结果${b.is_error?'(错误)':''}: ${String(b.content)}]`
         return `[${b.type}]`
       }).join(' ')
       return `${role}: `
-    }).map(s => this._stripNestedSummary(s)).filter(Boolean).join('\n\n').slice(0, SUMMARY_INPUT_CHAR_LIMIT)
+    }).map(s => this._stripNestedSummary(s)).filter(Boolean).join('\n\n')
     const instruction = customInstruction
       ? `${customInstruction}\n\n${text}`
       : `${NO_TOOLS_PREAMBLE}
@@ -402,10 +415,18 @@ ${text}`
       // maxTokens 原为 500，装不下提示词要求的六个栏目 + 原样保留的路径/URL/命令，
       // 模型只能靠删细节来适配限额。提到 1600 与 trimmed 的 1800 字符上限相称。
       throwIfAborted()
+      // 【2026-10-21 摘要请求必须关思考】
+      //
+      // 原来写死 'medium'，实测（同一份 1019213 字符输入、同一个模型）：
+      //   effort=max     输出   402 字符  completion=488    reasoning=303
+      //   effort=medium  输出   215 字符  completion=244    reasoning=117
+      //   effort=none    输出 23359 字符  completion=12292  reasoning=0
+      // 开思考时输出只有几百字符，用户看到的就是「/compact 只生成几十个字」。
+      // 摘要任务是「按九段格式整理已有内容」，不需要推理，关掉即可。
       const r = await this.api.createMessage({
         system:'你是上下文摘要助手。只总结给定的历史对话块，先判断每项任务在历史末尾的最终状态，再输出事实记录。完成事项不得写成待办；没有原文证据不得制造未完成项或下一步。不得编造完成状态。',
         messages:[{ role:'user', content:instruction }], maxTokens:SUMMARY_MAX_TOKENS,
-        abortSignal, thinkingEffort:'medium',
+        abortSignal, thinkingEffort:'none',
       })
       const out = r?.choices?.[0]?.message?.content?.trim()
       if (out) return out
@@ -427,7 +448,7 @@ ${text}`
           const r2 = await this.api.createMessage({
             system:'你是上下文摘要助手。只总结给定的历史对话块，先判断每项任务在历史末尾的最终状态，再输出事实记录。完成事项不得写成待办；没有原文证据不得制造未完成项或下一步。不得编造完成状态。',
             messages:[{ role:'user', content:instruction }], maxTokens:SUMMARY_MAX_TOKENS,
-            abortSignal, thinkingEffort:'medium',
+            abortSignal, thinkingEffort:'none',
           })
           const out2 = r2?.choices?.[0]?.message?.content?.trim()
           if (out2) { this._compactRetryDone = false; return out2 }

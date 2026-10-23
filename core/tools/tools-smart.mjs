@@ -502,11 +502,25 @@ export class SafeRenameTool extends Tool {
       let content; try { content = readFileSync(f, 'utf-8') } catch { continue }
       if (!content.includes(from)) continue
       const count = content.split(from).length - 1
-      refs.push({ file: f, count, rel: relative(dir, f) })
+      // 预览用：记下前几处命中的行号和该行内容（截断），模型 dry_run 时能判断
+      // 「要改的是不是这些位置」—— 只有文件数+计数看不出改的是哪一行。
+      const lines = []
+      if (input.dry_run) {
+        const ls = content.split('\n')
+        for (let i = 0; i < ls.length && lines.length < 3; i++) {
+          if (ls[i].includes(from)) lines.push({ line: i + 1, text: ls[i].trim().slice(0, 80) })
+        }
+      }
+      refs.push({ file: f, count, rel: relative(dir, f), lines })
     }
     if (refs.length === 0) return `未找到 "${from}" 的引用（目录: ${dir}）`
 
-    const preview = refs.map(r => `  ${r.rel} · ${r.count} 处`).join('\n')
+    const preview = refs.map(r => {
+      const head = `  ${r.rel} · ${r.count} 处`
+      // 行号示例最多 3 行，避免大文件刷屏；超出给「…」提示
+      const samples = (r.lines || []).map(l => `    L${l.line}: ${l.text}`)
+      return samples.length ? [head, ...samples].join('\n') : head
+    }).join('\n')
     if (input.dry_run) {
       return `SafeRename 预览（${refs.length} 个文件，${refs.reduce((a, r) => a + r.count, 0)} 处引用）:\n${preview}\n\n确认后去掉 dry_run 执行`
     }

@@ -16,6 +16,29 @@ const listProp = {
   description: `任务列表名，默认 ${TASK_DEFAULT_LIST}。不同项目/不同协作组用不同列表隔离`,
 }
 
+const idProp = { type: 'string', description: '任务 id（编号，如 "3"）' }
+const taskIdProp = {
+  type: 'string',
+  description: '（官方 2.1.303 同名字段，等价于 id）任务 id。与 id 二选一，同时给时以 taskId 为准。',
+}
+
+/**
+ * `taskId` → `id` 归一（官方 2.1.303 用 `taskId`，CCM 用 `id`）。
+ *
+ * 为什么两个都收：官方 TaskGet/TaskUpdate 的首参是 `taskId`（claude.js:1064923 附近），
+ * 模型按官方文档写 `taskId` 在 CCM 上会报「缺少 id」—— 用户完全看不出是自己
+ * 用对了字段名、而实现没跟上。
+ *
+ * 返回 null = 无需改动（基类约定）；否则返回新对象，不污染调用方。
+ */
+function coerceTaskId(input) {
+  if (!input || typeof input !== 'object') return null
+  if (input.taskId === undefined || input.taskId === null || input.taskId === '') return null
+  const taskId = String(input.taskId)
+  if (input.id === taskId) return null
+  return { ...input, id: taskId }
+}
+
 export class TaskCreateTool extends Tool {
   constructor() {
     super({
@@ -25,20 +48,34 @@ export class TaskCreateTool extends Tool {
         type: 'object',
         properties: {
           subject: { type: 'string', description: '任务标题，一句话说清要做什么' },
-          description: { type: 'string', description: '可选：详细说明、验收标准、相关文件' },
+          description: { type: 'string', description: '详细说明、验收标准、相关文件。必填——接手的人只看这个就知道做到哪、要做什么' },
           activeForm: { type: 'string', description: '可选：进行时描述（如「修复 parser 崩溃」），用于状态栏显示' },
           blockedBy: { type: 'array', items: { type: 'string' }, description: '可选：前置任务 id 列表，这些没完成前本任务无法被领取' },
+          metadata: {
+            type: 'object',
+            description: '可选：挂在这条任务上的任意结构化信息（官方 2.1.303 同名字段），如 {"files":["core/x.mjs"],"pr":12}。给接手的人看的机器可读线索，不参与状态判定。',
+          },
           list: listProp,
         },
-        required: ['subject'],
+        required: ['subject', 'description'],
       },
       maxResultSizeChars: 2000,
       validateInput(input) {
         const errors = []
         if (!input.subject || !String(input.subject).trim()) errors.push('subject is required')
+        // 官方 claude.js:1064470 的 description 没写 .optional()，是必填。
+        // 缺了它任务只剩一句标题，接手的人（尤其跨会话/跨 Agent）无从知道
+        // 做到哪、验收标准是什么 —— 而这正是 Task 相对 TodoWrite 的唯一价值。
+        if (!input.description || !String(input.description).trim()) {
+          errors.push('description is required（写清详细说明/验收标准/相关文件；只有标题的任务无法交接）')
+        }
         if (input.blockedBy && !Array.isArray(input.blockedBy)) errors.push('blockedBy must be an array')
         return { valid: errors.length === 0, errors }
       },
+      searchHint: 'create a task for multi-agent coordination',
+      backgrounding: 'never',
+      // 官方 TaskCreate 的 isConcurrencySafe 是 false —— 并发创建会争同一个任务文件
+      isConcurrencySafe: () => false,
     })
   }
 
@@ -46,7 +83,8 @@ export class TaskCreateTool extends Tool {
     const list = input.list || TASK_DEFAULT_LIST
     const t = createTask(list, input)
     const dep = t.blockedBy.length ? `，被 #${t.blockedBy.join(' #')} 阻塞` : ''
-    return `已创建任务 #${t.id}: ${t.subject}${dep}`
+    const meta = t.metadata ? `，metadata ${Object.keys(t.metadata).length} 个键` : ''
+    return `已创建任务 #${t.id}: ${t.subject}${dep}${meta}`
   }
 }
 
@@ -64,6 +102,10 @@ export class TaskListTool extends Tool {
         },
       },
       maxResultSizeChars: 4000,
+      isReadOnly: () => true,
+      isConcurrencySafe: () => true,
+      searchHint: 'list tasks and who is working on what',
+      backgrounding: 'never',
     })
   }
 
@@ -85,12 +127,24 @@ export class TaskGetTool extends Tool {
       input_schema: {
         type: 'object',
         properties: {
-          id: { type: 'string', description: '任务 id' },
+          id: idProp,
+          taskId: taskIdProp,
           list: listProp,
         },
         required: ['id'],
       },
       maxResultSizeChars: 4000,
+      isReadOnly: () => true,
+      isConcurrencySafe: () => true,
+      searchHint: 'read a task in full',
+      backgrounding: 'never',
+      coerceInput: coerceTaskId,
+      // required 里写的是 id，但官方字段名是 taskId —— 校验放行任一即可
+      validateInput(input) {
+        const has = (input.id !== undefined && input.id !== null && input.id !== '')
+          || (input.taskId !== undefined && input.taskId !== null && input.taskId !== '')
+        return has ? { valid: true } : { valid: false, errors: ['需要 id（或官方同名字段 taskId）'] }
+      },
     })
   }
 
@@ -104,6 +158,10 @@ export class TaskGetTool extends Tool {
     if (t.description) lines.push(`说明: ${t.description}`)
     if (t.blockedBy.length) lines.push(`被阻塞于: #${t.blockedBy.join(' #')}`)
     if (t.blocks.length) lines.push(`阻塞着: #${t.blocks.join(' #')}`)
+    // metadata：机器可读线索（相关文件、PR 号等），有就原样给出来
+    if (t.metadata && Object.keys(t.metadata).length) {
+      lines.push(`metadata: ${JSON.stringify(t.metadata)}`)
+    }
     // 进展留痕：交接时最有用的部分，放在最后完整显示
     if (t.comments?.length) {
       lines.push('', `进展记录（${t.comments.length} 条）:`)
@@ -125,13 +183,26 @@ export class TaskUpdateTool extends Tool {
       input_schema: {
         type: 'object',
         properties: {
-          id: { type: 'string', description: '任务 id' },
-          status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+          id: idProp,
+          taskId: taskIdProp,
+          status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'deleted'] },
           subject: { type: 'string' },
           description: { type: 'string' },
           activeForm: { type: 'string' },
           owner: { type: 'string', description: '归属 agent；传空字符串表示交还（变回无人认领）' },
           blockedBy: { type: 'array', items: { type: 'string' }, description: '可选：追加前置任务 id（双向维护依赖边）' },
+          addBlockedBy: {
+            type: 'array', items: { type: 'string' },
+            description: '（官方 2.1.303 同名字段，等价于 blockedBy）阻塞这条任务的 id 列表。',
+          },
+          addBlocks: {
+            type: 'array', items: { type: 'string' },
+            description: '（官方 2.1.303 字段）被这条任务阻塞的 id 列表——与 addBlockedBy 方向相反：本任务完成前，它们领不了。',
+          },
+          metadata: {
+            type: 'object',
+            description: '（官方 2.1.303 字段）要合并进任务的元数据键值；某个键传 null = 删除该键。合并语义，不会覆盖没提到的键。',
+          },
           comment: { type: 'string', description: '可选：追加一条进展留痕（做到哪、试过什么、卡在哪）。交接给别人时写这个，比只改 status 有用得多' },
           by: { type: 'string', description: '可选：留痕作者，默认用 owner 或 unknown' },
           list: listProp,
@@ -139,20 +210,47 @@ export class TaskUpdateTool extends Tool {
         required: ['id'],
       },
       maxResultSizeChars: 2000,
+      isConcurrencySafe: () => false,
+      searchHint: 'update a task status owner or dependencies',
+      backgrounding: 'never',
+      coerceInput: coerceTaskId,
+      validateInput(input) {
+        const has = (input.id !== undefined && input.id !== null && input.id !== '')
+          || (input.taskId !== undefined && input.taskId !== null && input.taskId !== '')
+        return has ? { valid: true } : { valid: false, errors: ['需要 id（或官方同名字段 taskId）'] }
+      },
     })
   }
 
   async execute(input) {
     const list = input.list || TASK_DEFAULT_LIST
+    // 【官方用 status:"deleted" 表示删除】claude.js:1064923 的
+    // `status: fn45122().or(fn2494("deleted"))` —— 官方没有独立 TaskDelete 工具。
+    // CCM 保留了独立 TaskDelete（更直观），但也要认这个官方写法，
+    // 否则模型按官方文档传 status:"deleted" 会走到 updateTask 被
+    // VALID_STATUS 拒绝，报「status 只能是 pending / in_progress / completed」。
+    if (input.status === 'deleted') {
+      const ok = deleteTask(list, input.id)
+      return ok ? `已删除任务 #${input.id}` : `任务 #${input.id} 不存在`
+    }
     const patch = {}
     for (const k of ['status', 'subject', 'description', 'activeForm']) {
       if (k in input) patch[k] = input[k]
     }
+    // metadata 走 updateTask 的合并语义（null = 删键）
+    if (input.metadata && typeof input.metadata === 'object') patch.metadata = input.metadata
     // owner 传空串 = 交还任务，转成 null 落盘
     if ('owner' in input) patch.owner = input.owner === '' ? null : input.owner
     const t = updateTask(list, input.id, patch)
     if (!t) return `任务 #${input.id} 不存在`
-    for (const dep of input.blockedBy || []) addDependency(list, String(dep), String(input.id))
+    // 依赖边两个方向都要收：
+    //   blockedBy / addBlockedBy → 这些任务阻塞我（addDependency(前置, 我)）
+    //   addBlocks              → 我阻塞这些任务（addDependency(我, 后置)）
+    // 官方 2.1.303 把「我阻塞谁」单独拆成 addBlocks，因为原来只能从
+    // 被阻塞方去写，反向建边得绕一圈。两个别名都收，避免按官方写法传了不生效。
+    const upstream = [...(input.blockedBy || []), ...(input.addBlockedBy || [])]
+    for (const dep of upstream) addDependency(list, String(dep), String(input.id))
+    for (const dep of (input.addBlocks || [])) addDependency(list, String(input.id), String(dep))
     // 进展留痕：作者优先用显式 by，其次用任务当前 owner
     let noted = ''
     if (input.comment) {
@@ -172,13 +270,18 @@ export class TaskClaimTool extends Tool {
       input_schema: {
         type: 'object',
         properties: {
-          id: { type: 'string', description: '任务 id' },
+          id: idProp,
+          taskId: taskIdProp,
           agent: { type: 'string', description: '领取者标识，如 main / worker-1 / reviewer' },
           list: listProp,
         },
         required: ['id', 'agent'],
       },
       maxResultSizeChars: 2000,
+      isConcurrencySafe: () => false,
+      searchHint: 'claim a task so others know you are on it',
+      backgrounding: 'never',
+      coerceInput: coerceTaskId,
     })
   }
 
@@ -203,12 +306,17 @@ export class TaskDeleteTool extends Tool {
       input_schema: {
         type: 'object',
         properties: {
-          id: { type: 'string', description: '任务 id' },
+          id: idProp,
+          taskId: taskIdProp,
           list: listProp,
         },
         required: ['id'],
       },
       maxResultSizeChars: 500,
+      isConcurrencySafe: () => false,
+      searchHint: 'delete a task and its dependency edges',
+      backgrounding: 'never',
+      coerceInput: coerceTaskId,
     })
   }
 

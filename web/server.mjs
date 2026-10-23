@@ -1272,7 +1272,7 @@ function formatCommandResult(name, runtime, args = []) {
     return `**回收站**\n\n${listTrash()}\n\n用法：\`/trash restore <序号>\` 恢复，\`/trash clear\` 清空。`
   }
   if (name === 'hooks') {
-    const events = ['SessionStart', 'SessionEnd', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'PostCompact', 'Stop']
+    const events = ['SessionStart', 'SessionEnd', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PreCompact', 'PostCompact', 'Stop', 'SubagentStart', 'SubagentStop', 'PermissionDenied']
     const config = hookManager.hooks || {}
     const lines = events.map(ev => {
       const entries = config[ev] || []
@@ -1582,7 +1582,7 @@ async function getWebCtxDeps() {
     runModelWizard: null,
     runKeyPoolWizard: null,
     onReload: () => {},                  // /agents 改配置后让 agent 重载；Web 每次命令都新建 ctx，不需额外动作
-    isProtectedPath: () => false,        // /add-dir 的 incognito 保护；Web 侧无此概念
+    isProtectedPath: () => false,        // incognito 保护路径判断；Web 侧无 incognito 概念
     cols: () => 60,                      // /goal 卡片宽度（与 1830 行的调用点一致）
     getTokens: () => 0,                  // /goal 的 token 预算显示；Web 侧由 server 统计，命令层暂不需要
     recordError: (kind, err) => {
@@ -1851,6 +1851,23 @@ async function executeSlashCommand(runtime, raw) {
       sub = 'show'
       args[0] = 'show'
     }
+    // 【2026-10-20 加】`/config key=value` 直接设值（对齐官方 2.1.303）。
+    // 官方 config2 的 argumentHint 就是 `key=value`，语义「按 key 设一项设置」。
+    // 这里必须**在 SUBCOMMANDS 白名单之外**单独放行 —— 否则 /config stream=off
+    // 会掉进下面「切 Provider」分支报「Provider 不存在：stream=off」，
+    // 这正是上面注释里抱怨过的那类「命令看起来是坏的」。
+    if (!SUBCOMMANDS.includes(sub) && args.some((a) => String(a).includes('='))) {
+      if (runtime.running) return { kind: 'output', text: '当前会话正在生成，完成后再改配置。' }
+      const { cmdConfig } = await import('../core/commands/cmd-extensions.mjs')
+      const cfgKV = loadWebConfig()
+      try {
+        const out = await cmdConfig(args, cfgKV, runtime.agent?.api || null,
+          (c) => saveWebConfig(c), null)
+        return { kind: 'output', text: typeof out === 'string' ? out : '(无输出)' }
+      } catch (e) {
+        return { kind: 'output', text: `命令执行失败：${e?.message || e}` }
+      }
+    }
     if (sub && SUBCOMMANDS.includes(sub)) {
       if (runtime.running) return { kind: 'output', text: '当前会话正在生成，完成后再改配置。' }
       const config = loadWebConfig()
@@ -2020,23 +2037,41 @@ async function executeSlashCommand(runtime, raw) {
     const lines = todos.map(t => `- [${t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '→' : '○'}] ${t.content || t.subject || ''}`)
     return { kind: 'output', text: `**待办清单**\n\n${lines.join('\n')}` }
   }
-  if (name === 'tasks' || name === 'team') {
-    const [{ listTasks, listTaskLists }, team] = await Promise.all([
-      import('../core/agent/tasks.mjs'), import('../core/agent/teams.mjs'),
-    ])
-    if (name === 'tasks') {
-      const lists = listTaskLists()
-      if (!lists.length) return { kind: 'output', text: '没有任务列表。提示 AI「用 TaskCreate 建个任务」即可。' }
-      const lines = []
-      for (const listName of lists) {
-        const tasks = listTasks(listName)
-        lines.push(`**${listName}**（${tasks.length} 个）`)
-        for (const t of tasks) {
-          lines.push(`- [${t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '→' : '○'}] ${t.subject}${t.owner ? ` @${t.owner}` : ''}${(t.blockedBy || []).length ? ` ⟵${t.blockedBy.join(',')}` : ''}`)
-        }
+  if (name === 'tasks') {
+    // 【2026-10-22 语义对齐】/tasks 跟官方一样管**后台进程**
+    //（官方 description: "View and manage everything running in the background"，
+    //  aliases: ["bashes"]），不再是持久任务清单 —— 那个改叫 /tasklist，
+    // 由 core/cmd-registry.mjs 的 tasklist 分支接管，不在这里重写一份。
+    //
+    // Web 侧没有 CLI 的全局 bg-tasks 注册表（那个 Map 在 web 进程里也存在，
+    // 但 Web 走的是 runtime.agent，子 Agent 不经过 CLI 的 registerBackgroundTask），
+    // 所以这里只反映「本 runtime 当前有没有在跑的东西」，取不到就直说，不假装。
+    const bg = await import('../core/agent/bg-tasks.mjs').catch(() => null)
+    const list = bg ? (() => { try { return bg.listBackgroundTasks() || [] } catch { return [] } })() : []
+    const sub = String(args[0] || '').toLowerCase()
+    if (sub === 'stop' || sub === 'kill') {
+      const target = args[1]
+      if (!target) return { kind: 'output', text: '用法：`/tasks stop <任务ID|名字>`' }
+      const hit = list.find(t => t.id === target) || bg?.findTaskByName?.(target)
+      if (!hit) return { kind: 'output', text: `未找到任务：${target}` }
+      if (hit.status !== 'running' && hit.status !== 'pending') {
+        return { kind: 'output', text: `任务 ${hit.id} 已是终态（${hit.status}），无需中止` }
       }
-      return { kind: 'output', text: lines.join('\n') }
+      const ok = bg.killBackgroundTask(hit.id)
+      return { kind: 'output', text: ok ? `已中止：${hit.id}` : `中止失败：${hit.id}` }
     }
+    if (!list.length) {
+      return { kind: 'output', text: '当前没有后台任务。\n\n子 Agent 用 `Agent(run_in_background: true)` 启动，跑起来后这里能看到。\n（持久任务清单用 `/tasklist`）' }
+    }
+    const lines = list.map(t => {
+      const dur = t.duration_ms ? ` ${(t.duration_ms / 1000).toFixed(1)}s` : ''
+      const name = t.agentName || t.description || ''
+      return `- \`${t.id}\` **${t.status}** ${t.type || ''}${dur}${name ? ` — ${name}` : ''}`
+    })
+    return { kind: 'output', text: `**后台任务**（${list.length}）\n\n${lines.join('\n')}\n\n\`/tasks stop <id|名字>\` 中止 · \`/tasklist\` 看持久任务清单` }
+  }
+  if (name === 'team') {
+    const team = await import('../core/agent/teams.mjs')
     const teams = team.listTeams()
     if (!teams.length) return { kind: 'output', text: '没有活跃团队。提示 AI「用 TeamCreate 组个队」即可。' }
     const out = []
@@ -2356,13 +2391,14 @@ async function buildAgent(runtime) {
     if (name === 'Bash') {
       const mode = webPermManager.getMode()
       if (mode === 'plan') {
-        const r = webPermManager.resolve('Bash', input || {})
+        const r = webPermManager.resolve('Bash', input || {}, tool)
         return r.allowed
       }
       const rules = webPermManager.loadRules()
       return !rules.deny.includes('Bash')
     }
-    const r = webPermManager.resolve(name, input || {})
+    // 传 tool 实例（同 CLI）：破坏性判定要看参数，见 permissions.mjs resolve 的说明
+    const r = webPermManager.resolve(name, input || {}, tool)
     return r.allowed
   }
   // 【2026-10-06 加 options】前端弹窗支持选项按钮 + 自由输入框
@@ -2434,6 +2470,10 @@ async function buildAgent(runtime) {
   // 不传的话 engine-setup 默认 `async () => true`（全放行）—— 子 Agent 就成了
   // 绕过 /permissions 的后门（default 模式的装饰工具拦截、plan 模式的写操作限制全部失效）。
   onPermissionRequest: canRunWebTool,
+  // 子 Agent 也继承 hooks（对齐 CLI / 官方 2.1.303）。不传的话 Web 端子 Agent
+  // 的 hookManager 是 null，hooks.json 里的 PreToolUse 规则对子 Agent 不生效 ——
+  // 与 CLI 侧同一个权限漏洞。顺带让 SubagentStart / SubagentStop 在 Web 端也触发。
+  hookManager,
   // 【Web 补齐四个 CLI 工具】
   //   CommandExec  —— 包装 executeSlashCommand，模型能跑程序内命令（/cost、/context 等）。
   //                   不带 / 前缀的原始串传进去（工具描述已说明），内部自己加。
@@ -2550,6 +2590,11 @@ async function buildAgent(runtime) {
   // 提前上报一条事件，前端弹提示，用户可以从容决定 /deep 还是让它收尾。
   agent.onTurnLimitApproaching = (turns, max) => {
     emit(runtime, 'turn_limit', { turns, max, deep: !!runtime.toolkit?.deepMode?.enabled })
+  }
+  // 【自动续轮提示】agent 到 maxTurns 会自动续（最多 3 次），CLI 在终端打黄字，
+  // Web 这里同样上报事件，前端可弹提示——否则用户只能从续轮那轮的正文里自己发现。
+  agent.onAutoContinue = (n, max) => {
+    emit(runtime, 'auto_continue', { count: n, max })
   }
   // PreToolUse / PostToolUse 由 agent 内部触发；与 CLI 同一份 hooks.json
   agent.hookManager = hookManager
@@ -3076,36 +3121,26 @@ const server = http.createServer(async (req, res) => {
       //   QQ     → ~/.claude-code-mobile/qq-config.json（/qq setup 写入）
       // ═══════════════════════════════════════════════════════════════
       if (req.method === 'GET' && url.pathname === '/api/connectors/status') {
-        const out = { github: { connected: false, detail: '' }, qq: { connected: false, detail: '' } }
-        try {
-          const { githubStatus } = await import('../core/integrations/github.mjs')
-          const st = githubStatus()
-          out.github = {
-            connected: !!st.configured,
-            // 字段名对齐 core/github.mjs 的 githubStatus()：defaultRepo / tokenFrom / masked
-            detail: st.configured
-              ? `${st.defaultRepo ? `仓库 ${st.defaultRepo}` : '已配置 token'} · ${st.masked}`
-              : '未配置',
-            defaultRepo: st.defaultRepo || null,
-            tokenFrom: st.tokenFrom || 'none',
-            masked: st.masked || '',
-          }
-        } catch (e) {
-          out.github.error = e?.message || String(e)
-        }
-        try {
-          const qq = JSON.parse(readFileSync(join(DATA_DIR, 'qq-config.json'), 'utf8'))
-          out.qq = {
-            connected: !!qq.qqActive,
-            detail: qq.qqActive
-              ? `监听中 · 主人号 ${qq.owner || '未设'} · API ${qq.napcatApi || 'http://127.0.0.1:5700'}`
-              : `未开启 · 主人号 ${qq.owner || '未设'}`,
-            owner: qq.owner || null,
-          }
-        } catch (e) {
-          out.qq.error = e?.code === 'ENOENT' ? '未配置' : (e?.message || String(e))
-        }
-        return json(res, 200, out)
+        // 【2026-10-20 重写】原来这里手写两段 if/else 探针，其中 QQ 那段判断的是
+        // `qq.qqActive` —— 但 2026-09-24 之后 QQ 配置的真实字段是
+        // `endpoints.<端>.enabled`，qqActive 只是给旧版本留的只读镜像，
+        // 没有任何代码再写它。于是「/qq on 之后连接器页面永远显示未连接」。
+        //
+        // 现在统一走 core/integrations/connectors.mjs（CLI 的 /connectors 命令
+        // 读的是同一份）—— 探针只有一处实现，两端不可能再漂移。
+        //
+        // 【向后兼容】响应顶层仍然保留 `github` / `qq` 两个键（前端
+        // CustomizePage / connectorCatalog 现在按这两个键读），
+        // 新加的 `connectors` 数组与 `meta` 供新界面用。
+        const { allConnectorStatuses, connectorSummary } = await import('../core/integrations/connectors.mjs')
+        const list = allConnectorStatuses({ mcpClient })
+        const byId = Object.fromEntries(list.map(c => [c.id, c]))
+        return json(res, 200, {
+          github: byId.github || { connected: false, detail: '未配置' },
+          qq: byId.qq || { connected: false, detail: '未配置' },
+          connectors: list,
+          meta: connectorSummary({ mcpClient }),
+        })
       }
       if (req.method === 'GET' && url.pathname === '/api/wizards') {
         const { wizardIds, getWizard } = await import('../core/commands/wizard-steps.mjs')

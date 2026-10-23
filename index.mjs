@@ -1,6 +1,6 @@
 // Claude Code Mobile（版本号从 package.json 读取，见 CLI_VERSION）
 // @ts-nocheck
-import { AgentStatusTool, AgentStopTool, AgentOutputTool } from './core/tools/tools-agent-status.mjs'
+import { AgentStatusTool, AgentStopTool, AgentOutputTool, ListAgentsTool } from './core/tools/tools-agent-status.mjs'
 import { AgentMemoryTool } from './core/tools/tools-agent-memory.mjs'
 import { FullscreenSession } from './core/ui/fullscreen-adapter.mjs'
 import { wrapToWidth } from './core/ui/fullscreen.mjs'
@@ -34,9 +34,10 @@ import { join, resolve, relative, isAbsolute, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ApiClient } from './core/api/api.mjs'
 import { Agent } from './core/agent/agent.mjs'
-import { ToolRegistry } from './core/tools/tools.mjs'
+import { ToolRegistry, applyDeferredTools } from './core/tools/tools.mjs'
+import { ToolSearchTool } from './core/tools/tools-toolsearch.mjs'
 import { SYSTEM_PROMPT, SESSION_START_PROMPT, resolvePromptVars, fillPromptVars, DEFAULT_OUTPUT_STYLE_SECTION } from './core/infra/prompts.mjs'
-import { FileReadTool, FileWriteTool, FileEditTool, MultiEditTool } from './core/tools/file-tools.mjs'
+import { FileReadTool, FileWriteTool, FileEditTool, MultiEditTool, NotebookEditTool } from './core/tools/file-tools.mjs'
 import { GlobTool, GrepTool, CodeSearchTool } from './core/tools/search-tools.mjs'
 import { PTYBashTool } from './core/infra/pty.mjs'
 import { BashOutputTool, KillShellTool } from './core/agent/bg-bash.mjs'
@@ -57,13 +58,18 @@ import { MultiUndoStore } from './core/session/undo-multi.mjs'
 import { SkillLoader, SkillTool, ensureGlobalSkillsDir, globalSkillsDir, expandActiveSkill } from './core/commands/skills.mjs'
 import { HookManager } from './core/infra/hooks.mjs'
 import { Exporter } from './core/session/export.mjs'
-import { PlanMode, EnterPlanModeTool, ExitPlanModeTool, DeepMode, EnterDeepModeTool, ExitDeepModeTool, EnterWatchTool, ExitWatchTool, CoordinatorMode, SubAgentTool, getBackgroundTaskStatus, listBackgroundTasks, setOnTasksChanged, listKeptAgents, getRunningSubagents, MAX_CONCURRENT_SUBAGENTS, NORMAL_MAX_TURNS, DEEP_MAX_TURNS } from './core/agent/plan.mjs'
+import { PlanMode, EnterPlanModeTool, ExitPlanModeTool, DeepMode, EnterDeepModeTool, ExitDeepModeTool, EnterWatchTool, ExitWatchTool, CoordinatorMode, SubAgentTool, getBackgroundTaskStatus, listBackgroundTasks, setOnTasksChanged, listKeptAgents, getRunningSubagents, MAX_CONCURRENT_SUBAGENTS, NORMAL_MAX_TURNS, DEEP_MAX_TURNS, killBackgroundTask } from './core/agent/plan.mjs'
+// findTaskByName 只在 bg-tasks 里，plan.mjs 没转出 —— /tasks stop 要按名字反查。
+import { findTaskByName } from './core/agent/bg-tasks.mjs'
 import { PermissionManager } from './core/infra/permissions.mjs'
 import { MCPClient } from './core/integrations/mcp-client.mjs'
 import { HashlineReadTool, HashlineEditTool, HashlineGrepTool } from './core/tools/tools-hashline.mjs'
 import { DshPluginTool } from './core/tools/tools-dsh-plugin.mjs'
 import { ApplyPatchTool, TestTool, DiagnosticsTool, RepoMapTool, SymbolsTool, SafeRenameTool, SleepTool } from './core/tools/tools-smart.mjs'
-import { CronCreateTool, CronListTool, CronDeleteTool } from './core/tools/tools-cron.mjs'
+import { LspTool } from './core/tools/lsp.mjs'
+import { MonitorTool } from './core/tools/tools-monitor.mjs'
+import { CronCreateTool, CronListTool, CronDeleteTool, ScheduleWakeupTool } from './core/tools/tools-cron.mjs'
+import { EnterWorktreeTool, ExitWorktreeTool } from './core/tools/tools-worktree.mjs'
 import { startCronScheduler, missedOneShots, deleteCronTask } from './core/infra/cron.mjs'
 import { runNonInteractive } from './core/infra/noninteractive.mjs'
 import { killAllChildren } from './core/infra/pty.mjs'
@@ -71,7 +77,7 @@ import { DATA_DIR, migrateLegacyData, resolveConfigPath, HOOKS_PATH, MCP_PATH, P
 import { ReadLine } from './core/ui/readline.mjs'
 import { InputHistory, CommandExecTool, UserInputHistoryTool, MemoryTool, setMemoryInvalidateHook, NON_INTERACTIVE_HINTS } from './core/agent/agent-tools.mjs'
 import { cmdAgents } from './core/commands/cmd-agents.mjs'
-import { cmdContext, cmdDiff, cmdDoctor, cmdStats, cmdMemory, cmdReview, cmdPermissions, cmdTemperature, cmdConfig, persistActivePoolKey, syncActiveProvider, recordConfigEvent, drainConfigEvents } from './core/commands/cmd-extensions.mjs'
+import { cmdContext, cmdContextDetail, cmdDiff, cmdDoctor, cmdStats, cmdMemory, cmdReview, cmdPermissions, cmdTemperature, cmdConfig, persistActivePoolKey, syncActiveProvider, recordConfigEvent, drainConfigEvents } from './core/commands/cmd-extensions.mjs'
 import { getWorkspacePath, setWorkspacePath } from './core/infra/workspace.mjs'
 // 【2026-10-08 合并】原来这里还 import 了 listOutputStyles / getOutputStyle /
 // ensureOutputStylesDir / DEFAULT_OUTPUT_STYLE_NAME —— /style 改为操作回复偏好后
@@ -94,6 +100,9 @@ import { webCommand } from './core/commands/cmd-web.mjs'
 import { makeMiscCommands } from './core/commands/cmd-misc.mjs'
 import { makeSideCommands } from './core/commands/cmd-side.mjs'
 import { makeTeamTaskCommands } from './core/commands/cmd-team-task.mjs'
+import { makeAgentOpsCommands } from './core/commands/cmd-agent-ops.mjs'
+import { makeUxCommands } from './core/commands/cmd-ux.mjs'
+import { makeDiagCommands } from './core/commands/cmd-diag.mjs'
 import { makePermissionsCommand } from './core/commands/cmd-permissions.mjs'
 import { makeHelpCommand } from './core/commands/cmd-help.mjs'
 import { normalizeProviderUrl, providerEndpointPreview } from './core/api/provider-url.mjs'
@@ -115,8 +124,12 @@ import { handleGoalCommand } from './core/commands/cmd-goal.mjs'
 import { snapshot as goalSnapshot, setGoalStatus as setGoalStatusRaw } from './core/agent/goal.mjs'
 import { runGoalLoop, buildGoalContract, buildGoalStateNote, renderGoalOutcome, renderGoalCard } from './core/agent/goal-runtime.mjs'
 import { TEAM_TOOLS } from './core/tools/tools-teams.mjs'
+import { SESSION_TOOLS } from './core/tools/tools-sessions.mjs'
+import { registerSession, heartbeat as peerHeartbeat, readPeerInbox } from './core/agent/sessions.mjs'
 import { GITHUB_TOOLS } from './core/tools/tools-github.mjs'
 import { githubStatus, saveGithubConfig, ghApi, parseRepo } from './core/integrations/github.mjs'
+// 连接器注册表：/connectors 的子命令补全从这里取候选（以后加连接器不用改 index.mjs）
+import { listConnectors } from './core/integrations/connectors.mjs'
 import { listTeams, teamOverview, formatTeamOverview, deleteTeam, inboxCounts } from './core/agent/teams.mjs'
 import { ImageGenTool, getImageGenConfig, setImageGenConfig, resolveEndpoint as resolveImageEndpoint } from './core/tools/tools-imagegen.mjs'
 import { ocrFile, ocrImage, setVisionConfig, visionEnabled } from './core/phone/ocr.mjs'
@@ -136,7 +149,7 @@ import { context7Help, context7Status, setupContext7, setContext7Enabled } from 
 import { listTraces, readTrace, formatTraceList, formatTraceEvents, formatTraceReplay, TRACE_DIR } from './core/api/trace.mjs'
 import { runSideQuestion } from './core/infra/side-question.mjs'
 import { ContextFileTracker, formatContextFiles } from './core/session/context-files.mjs'
-import { buildStatusReport, formatStatusReport, runStatusLineCommand, buildStatusLinePayload, buildMetricsLine } from './core/infra/status-report.mjs'
+import { buildStatusReport, formatStatusReport, runStatusLineCommand, buildStatusLinePayload, buildMetricsLine, probeApiConnectivity, PROBE_TIMEOUT_MS } from './core/infra/status-report.mjs'
 import { getMemoryDir, listMemories, findRelevantMemories, saveMemory, deleteMemory, formatMemoryList, formatMemoriesForPrompt, readEntrypoint, MEMORY_TYPES } from './core/infra/memdir.mjs'
 import { loadEnvFile, resolveEnvDeep, resolveEnvString, hasUnresolvedPlaceholders } from './core/api/env-secrets.mjs'
 // 系统提示词分段缓存（对齐官方 systemPromptSections.ts）——见该文件顶部的设计说明
@@ -253,24 +266,77 @@ function releaseMainWakeLock() {
   try { execFileSync('termux-wake-unlock', [], { timeout: 5000, stdio: 'ignore' }) } catch {}
 }
 
-// 【2026-09-17 改异步】原来 execFileSync 实测阻塞 0.6~1.1s（termux-api 往返）：
-// 启动时挡在首屏前，每 5 分钟心跳也把主线程卡一下。发通知没人等结果 ——
-// 改 detached spawn（同上面 wake-lock 的模式）。失败不再可感，但通知本就不是进关键路径的东西。
-function showMainNotification(title, content) {
+// ─── AudioTrack 静音保活 ─────────────────────────────────────────
+//
+// 【2026-10-22 新增，替代 MediaPlayer 静音音频】
+//
+// 旧方案用 termux-media-player 循环播 AMR：需要解码、每 55 秒重启一次，
+// 实测 CPU 30%+。
+//
+// 新方案用 AudioTrack MODE_STATIC：
+//   · 静音 PCM 一次性写进硬件缓冲区
+//   · setLoopPoints(0, frames, -1) 让硬件无限循环，应用侧不再喂数据
+//   · 实测 CPU 约 0%（AudioTrack 进程 + audioserver 合计 15 秒 0ms）
+//
+// 为什么必须挂在 Termux 的 uid 上（反编译 PowerKeeper 确认）：
+//   PowerCheckerPolicy.isAudioActive(uid) 遍历 AudioManager.getActivePlaybackConfigurations()，
+//   找 clientUid == 目标 uid 且 isActive == true 的条目。
+//   命中 → RULE_IGNORE_REASON_AUDIO_ACTIVE(203) → 不杀。
+//   所以播放配置必须属于 10286（com.termux），不能是别的应用代持。
+//
+// 【进程存活】app_process 起的进程会被系统当孤儿回收（实测 nohup/setsid 都撑不过 10 秒）。
+//   唯一可靠的方式是由 CCM 主进程持有这个子进程句柄 —— 主进程活着它就活着。
+//   所以这里用 spawn 且**不 unref**，句柄存在模块级变量里。
+
+let audioTrackProc = null
+let audioTrackDexReady = false
+
+function ensureAudioTrackKeepalive() {
+  if (audioTrackProc && !audioTrackProc.killed) return true
+
+  const dex = '/data/local/tmp/ccm-audio.dex'
+  const script = join(process.cwd(), 'core', 'audio-keepalive.sh')
+
   try {
-    const child = spawn('termux-notification', [
-      '-i', MAIN_NOTIFY_ID,
-      '--ongoing',
-      '--priority', 'low',
-      '--alert-once',
-      '-t', String(title || 'Claude Code').slice(0, 40),
-      '-c', String(content || '后台运行中').slice(0, 120),
-    ], { stdio: 'ignore', detached: true })
-    child.once?.('error', () => {})
-    child.unref?.()
+    // dex 不存在就先让脚本生成（脚本内部用 javac + d8）
+    if (!audioTrackDexReady) {
+      try { execFileSync('bash', [script, 'ensure-dex'], { timeout: 120000, stdio: 'ignore' }) } catch {}
+      audioTrackDexReady = true
+    }
+    if (!existsSync(dex)) return false
+
+    // 【2026-10-22 实测】app_process 在普通后台方式（nohup/setsid/spawn）下都会被当孤儿
+    // 进程回收，活不过几秒。必须放进 tmux 的持久伪终端里才稳（实测 CPU 约 0.1%）。
+    // 且不能 su 切 uid —— Termux 本身就是 10286，直接跑 /system/bin/app_process 即可。
+    audioTrackProc = spawn('tmux', [
+      'new-session', '-d', '-s', 'ccm-audio',
+      `CLASSPATH=${dex} /system/bin/app_process /system/bin com.ccm.audio.CcmAudio`,
+    ], { stdio: 'ignore' })
+
+    audioTrackProc.once?.('error', () => { audioTrackProc = null })
+    audioTrackProc.once?.('exit', () => { audioTrackProc = null })
     return true
-  } catch { return false }
+  } catch {
+    audioTrackProc = null
+    return false
+  }
 }
+
+function releaseAudioTrackKeepalive() {
+  try {
+    if (audioTrackProc && !audioTrackProc.killed) audioTrackProc.kill('SIGTERM')
+  } catch {}
+  audioTrackProc = null
+}
+
+// 【2026-10-20 删除 showMainNotification】
+// 这个函数原来负责挂一个 ongoing 通知（"后台运行中"），但它的**唯一调用点
+// 早已被移除**：启动时现在只调 hideMainNotification()（见约 2799 行），
+// 用来清掉老版本遗留的通知，不再新挂。
+// 保留一个零调用的函数会让人误以为"通知还在发"，排查后台耗电/通知栏时白找一轮。
+// 真要恢复通知能力，从 git 历史里取回这段即可（detached spawn termux-notification）。
+//
+// 注意 hideMainNotification 是**活的**，别一起删。
 
 function hideMainNotification() {
   try { execFileSync('termux-notification-remove', [MAIN_NOTIFY_ID], { timeout: 3000, stdio: 'ignore' }) } catch {}
@@ -700,6 +766,19 @@ async function main() {
   // 全屏模式：欢迎页交给 FullscreenSession 当固定 header，不直接写 stdout。
   // 关闭时（默认）保持原来的流式输出。
   let fsSession = null
+  /**
+   * 专注视图（/focus on）—— 只留「我问的 / 摘要 / 你答的」。
+   *
+   * 【为什么放在这一层而不是渲染器】渲染器只认「逻辑行数组」，不区分这一行
+   * 是正文还是工具行。判断依据（工具名、⎿ 前缀、思考色）全都在这一层
+   * 生成，所以在**生成处**拦截最准，也最省：不写进 body 就不需要任何
+   * 「事后隐藏 / 恢复」的重排逻辑。
+   *
+   * 【隐藏 ≠ 不执行】工具照常跑、结果照常回给模型，只是不画。
+   * 退出 focus 后，之后的新输出正常显示；之前被隐藏的内容不会补画
+   * （历史里本来就没存 —— 见下方各拦截点的说明）。
+   */
+  let focusMode = false
   // spinner/状态栏更新函数：全屏块（3400+）里重新赋值为真实现；
   // 启动时恢复语音朗读设置（音色/语速/开关都存在 config.voice）。
   // 放在这里而不是模块顶层：config 到这一步才完成 provider 合并与占位符解析。
@@ -818,7 +897,7 @@ async function main() {
         protocol: initialFallback.protocol || 'openai',
         maxTokens: initialFallback.maxTokens || config.maxTokens,
         temperature: initialFallback.temperature ?? config.temperature,
-        thinkingConfig: fbThinking.enabled ? { enabled: true, effort: fbThinking.effort || 'high' } : null,
+        thinkingConfig: fbThinking.enabled ? { enabled: true, ...(fbThinking.effort ? { effort: fbThinking.effort } : {}) } : null,
         replayReasoning: fbThinking.replay === true,
       })
     }
@@ -898,10 +977,26 @@ async function main() {
 
   const permManager = new PermissionManager()
   const hookManager = new HookManager(HOOKS_PATH, moduleLogger)
-  await hookManager.trigger('SessionStart', { event: 'SessionStart' })
+  // SessionStart 的 source 字段（对齐官方 schema：startup / resume / clear / compact / fork）。
+  //
+  // 【为什么要传】原来只传 { event }，hook 脚本**无法区分**"首次启动"和"Ctrl+X 续接上次会话"——
+  // 两者在 hook 眼里长得一模一样。于是「只在全新会话时提醒我」这类 hook 每次重启都会误触发。
+  //
+  // 【为什么直接读环境变量】isRestart 要到 2686 行才定义（会话恢复逻辑在那儿），
+  // 而这里 907 行就要发事件。同一份判断依据（CCM_RESTART=1，由 start.sh 传），
+  // 读环境变量比把整个恢复流程提前更安全。
+  // 注意：此刻还没做 /resume，所以这里只能区分 startup / resume 两种；
+  // /clear 和 /compact 触发的 SessionStart 在各自的处理分支里另行发送（见对应位置）。
+  await hookManager.trigger('SessionStart', {
+    event: 'SessionStart',
+    source: process.env.CCM_RESTART === '1' ? 'resume' : 'startup',
+  })
 
   ensureGlobalSkillsDir()
   const skillLoader = new SkillLoader(['./skills', globalSkillsDir()])
+  // 本会话展开过的 skill 名（/skill-doctor 要看「用过哪些」，光看 loader.list()
+  // 只知道「有哪些」）。放在启动作用域里而不是模块级：/clear 或重开会话应当重置。
+  const activeSkills = new Set()
   const claudeMd = ClaudeMdLoader.load(process.cwd())
   // 不打「加载了 N 个 CLAUDE.md」：加载成功是常态，用 /memory 能查，
   // 启动时汇报只是把真正要看的东西挤下去。
@@ -930,6 +1025,9 @@ async function main() {
   registry.register(new FileWriteTool(multiUndo))
   registry.register(new FileEditTool(multiUndo))
   registry.register(new MultiEditTool(multiUndo))
+  // NotebookEdit：.ipynb 单元格编辑（对齐官方 2.1.303）。
+  // 必须与 Read 配合：cell_id 只能从 Read 的 <cell id="..."> 视图里拿到。
+  registry.register(new NotebookEditTool(multiUndo))
   registry.register(new PTYBashTool())
   registry.register(new BashOutputTool())
   registry.register(new KillShellTool())
@@ -946,7 +1044,11 @@ async function main() {
   registry.register(new GitCommitTool())
   // 注入 hookManager：skill 可以在 frontmatter 里声明 hooks，
   // 展开时注册成 session 级钩子（以 skill 目录为 cwd）。
-  registry.register(new SkillTool(skillLoader, { hookManager }))
+  // onExpand 登记到 activeSkills，供 /skill-doctor 统计「本会话用过哪些」。
+  registry.register(new SkillTool(skillLoader, {
+    hookManager,
+    onExpand: (name) => activeSkills.add(name),
+  }))
   registry.register(new UserInputHistoryTool(inputHistory))
   // 不提供 Restart 工具：AI 自动重启会把本轮正文截掉，用户看不到改了什么。
   // 重启统一由用户 Ctrl+X 触发。
@@ -961,10 +1063,20 @@ async function main() {
   registry.register(new CronCreateTool())
   registry.register(new CronListTool())
   registry.register(new CronDeleteTool())
+  // ScheduleWakeup：结束本轮、释放进程、到点再唤醒。
+  // 与 EnterWatch 的区别：watch 是 agent 内循环一直占着进程（手机端屏幕常亮、
+  // CPU 空转、电池狂掉），这个睡着的这段时间进程是空闲的。
+  // 传 getAgent 闭包：工具要置位 agent._wakeupScheduled，让主循环本轮结束。
+  // agent 在 850 行声明为 null、之后才赋值，闭包求值发生在工具执行时（那时已有值）。
+  registry.register(new ScheduleWakeupTool({ getAgent: () => agent }))
   // 智能工作流工具集（ApplyPatch / Test / Diagnostics / RepoMap / Symbols / SafeRename）
   registry.register(new ApplyPatchTool(multiUndo))
   registry.register(new TestTool())
   registry.register(new DiagnosticsTool())
+  registry.register(new LspTool())
+  // Monitor：后台命令输出推式通知（官方同名工具对齐）。
+  // 会 spawn 长驻进程，非只读，不进 PLAN_ALLOWED。
+  registry.register(new MonitorTool())
   registry.register(new RepoMapTool())
   registry.register(new SymbolsTool())
   registry.register(new SafeRenameTool(multiUndo))
@@ -1016,6 +1128,19 @@ async function main() {
   registry.register(new EnterWatchTool(() => agent.setWatchMode(true)))
   registry.register(new ExitWatchTool(() => agent.setWatchMode(false)))
 
+  // ── worktree 会话切换（对齐官方 2.1.303 的 EnterWorktree / ExitWorktree）──
+  // 「建 worktree」和「把会话切过去」必须是一步：手动 git worktree add 之后
+  // agent.cwd 不变，后续 Read/Edit/Bash 还在原目录跑，等于没隔离。
+  // getCwd/setCwd 读写的都是 agent.cwd（每轮工具调用都从这里取 ctx.cwd）。
+  // 用 getter 而不是抓快照：agent 是 let 变量，这里注册时它还是 null。
+  registry.register(new EnterWorktreeTool({
+    getCwd: () => agent?.cwd || process.cwd(),
+    setCwd: (p) => { if (agent) agent.cwd = p },
+  }))
+  registry.register(new ExitWorktreeTool({
+    getCwd: () => agent?.cwd || process.cwd(),
+    setCwd: (p) => { if (agent) agent.cwd = p },
+  }))
   // CompactService 用共享的 moduleLogger（定义见 750 行附近）。
   // 早年这里是个独立的 compactLogger，跟 QQ 桥/automem 各写各的 ——
   // 结果有的加前缀有的不加，`[Compact] [Compact]` 就是这么来的。
@@ -1075,25 +1200,70 @@ async function main() {
     process.stdout.write(text)
   }
   let mcpReadyResolved = false
+  /**
+   * 把 mcpClient 当前的工具清单同步进 registry。
+   *
+   * 【为什么抽成函数】两处需要：① 启动时 loadConfig 之后；② /mcp reconnect 之后。
+   * 原来这段逻辑内联在 loadConfig 的 .then 里，reconnect 无处复用 —— 重连后
+   * 工具清单变了（服务器升级 / allowedTools 改了），registry 里还是旧适配器，
+   * 调用它会报 "Server xxx not found"（旧适配器指向已摘掉的 server）。
+   *
+   * 【语义是「对齐」不是「只增」】重连后某工具可能消失（服务器升级删了它），
+   * 所以要把「上次注册过的 MCP 工具里、这次不存在的」从 registry 摘掉。
+   * 否则幽灵工具会一直挂在工具列表里，模型偶尔调一次就报错。
+   *
+   * @returns {string} 给用户看的一句话（reconnect 直接拼进输出）
+   */
+  const syncMcpTools = () => {
+    const now = mcpClient.getAllTools()
+    const nowNames = new Set(now.map(t => t.name))
+    // 摘掉已经不存在的（只摘 MCP 来源的，别碰内置工具）
+    //
+    // 【为什么直接操作内部 Map 而不加 registry.unregister()】
+    // ToolRegistry（core/tools/tools.mjs）没有删除方法。加一个是最干净的做法，
+    // 但那个文件属于工具组（impl-tools）的改动范围，本轮按边界不动它 ——
+    // 用 `registry.tools` / `registry._lower` 这两个稳定内部结构做等价删除，
+    // 且全程有存在性判断（结构变了就跳过删除，退化行为只是"幽灵工具留着"，
+    // 不会崩）。等工具组加了 unregister，这里换成公开方法即可。
+    let removed = 0
+    const toolMap = registry.tools
+    const lowerMap = registry._lower
+    if (toolMap instanceof Map) {
+      for (const t of registry.list()) {
+        if (!t.mcpServer) continue
+        if (nowNames.has(t.name)) continue
+        toolMap.delete(t.name)
+        try { lowerMap?.delete?.(String(t.name).toLowerCase()) } catch {}
+        removed++
+      }
+    }
+    // 注册新的（已有的跳过，避免重复注册报错）
+    let added = 0
+    for (const tool of now) {
+      if (registry.get(tool.name)) continue
+      const mcpToolInstance = Object.assign(
+        new (class extends McpBaseTool {
+          constructor() {
+            super({ name: tool.name, description: tool.description, input_schema: tool.input_schema })
+          }
+          async execute(input) {
+            const result = await mcpClient.callTool(tool.mcpServer, tool.mcpTool, input, agent?._activeTrace)
+            return JSON.stringify(result)
+          }
+        })(),
+        { mcpServer: tool.mcpServer, mcpTool: tool.mcpTool }
+      )
+      registry.register(mcpToolInstance)
+      added++
+    }
+    // agent 的 tools 是构造时的数组快照，MCP 晚到就必须补进去，否则模型看不到这些工具
+    if (typeof agent !== 'undefined' && agent) agent.tools = registry.list()
+    if (removed === 0 && added === 0) return ''
+    return `工具清单已同步：新增 ${added} 个${removed ? `，移除 ${removed} 个` : ''}（共 ${now.length} 个 MCP 工具）`
+  }
   const mcpReady = mcpClient.loadConfig(MCP_PATH)
     .then(() => {
-      for (const tool of mcpClient.getAllTools()) {
-        const mcpToolInstance = Object.assign(
-          new (class extends McpBaseTool {
-            constructor() {
-              super({ name: tool.name, description: tool.description, input_schema: tool.input_schema })
-            }
-            async execute(input) {
-              const result = await mcpClient.callTool(tool.mcpServer, tool.mcpTool, input, agent?._activeTrace)
-              return JSON.stringify(result)
-            }
-          })(),
-          { mcpServer: tool.mcpServer, mcpTool: tool.mcpTool }
-        )
-        registry.register(mcpToolInstance)
-      }
-      // agent 的 tools 是构造时的数组快照，MCP 晚到就必须补进去，否则模型看不到这些工具
-      if (typeof agent !== 'undefined' && agent) agent.tools = registry.list()
+      syncMcpTools()
       mcpReadyResolved = true
       // 不提示连接成功：这条消息是异步到达的，会插进全屏模式的正文区，
       // 混在对话内容里很碍眼。要看状态用 /status。
@@ -1288,7 +1458,9 @@ async function main() {
       }
       return true
     }
-    const r = permManager.resolve(name, input || {})
+    // 传 tool 实例进去：破坏性判定是看**参数**的（ExitWorktree 只有 remove 才破坏），
+    // 只传名字的话 plan 模式没法区分「切目录」和「删目录」。
+    const r = permManager.resolve(name, input || {}, tool)
     if (r.allowed) return true
     if (r.needAsk) {
       // 其他工具的 needAsk 也不等人：直接拒绝，返回原因（避免无人值守卡住）
@@ -1303,6 +1475,14 @@ async function main() {
   registry.register(new AgentStatusTool())
   registry.register(new AgentStopTool())
   registry.register(new AgentOutputTool())
+  // ListAgents：对应官方 2.1.x 的 ListAgents（旧名 ListPeers）。
+  // 作用是「发消息前先看有哪些名字可用」—— 子 Agent 是运行时注册的，
+  // 团队成员取决于别人 join 过没有，瞎猜 to 会白跑一轮。
+  registry.register(new ListAgentsTool())
+  // 跨会话（CLI ↔ Web）：ListSessions / SendMessagePeer / ReleaseHeldMessages。
+  // 与上面三个的分工见 tools-sessions.mjs 文件头 —— 简单说，
+  // ListAgents 管本进程内，ListSessions 管本机其他进程。
+  for (const t of SESSION_TOOLS) registry.register(t)
   // 主 Agent 也能用记忆（type=main）；子 Agent 由 plan.mjs 注入自己的类型
   registry.register(new AgentMemoryTool({ getAgentType: () => 'main' }))
   // 【必须传函数而不是 registry.list() 快照】
@@ -1316,6 +1496,11 @@ async function main() {
     tools: () => registry.list(),
     onPermissionRequest,
     getSubagentTypes: () => customAgents.mergeInto(BUILTIN_SUBAGENT_TYPES),
+    // 【子 Agent 继承 hooks（对齐官方 2.1.303）】不传的话子 Agent 的
+    // hookManager 是 null，用户在 hooks.json 里配的 PreToolUse 规则
+    // （禁改某目录、写前格式化…）对子 Agent **完全不生效** —— 子 Agent 能绕过去，
+    // 这是权限漏洞。顺带也才有 SubagentStart / SubagentStop 两个生命周期事件。
+    hookManager,
   }))
   const subAgentTool = registry.get('Agent')
   Object.defineProperty(subAgentTool, 'systemPromptBase', {
@@ -1572,7 +1757,8 @@ async function main() {
     // spinner 那一行本来就是 Percolating…/Cogitating… 这类英文动词，
     // 混中文会割裂；正文仍然是中文。
     if (thinkStatus === 'thinking') {
-      const eff = config.thinking?.enabled ? config.thinking.effort || 'high' : null
+      // 没设 effort = auto 档，显示 auto 而不是假装成 high
+      const eff = config.thinking?.enabled ? (config.thinking.effort || 'auto') : null
       return eff ? `thinking (${eff})` : 'thinking'
     }
     if (typeof thinkStatus === 'number') {
@@ -1726,7 +1912,13 @@ async function main() {
     if (!promptCleared) clearPromptLine()
   }
 
-  const writeSideChannel = (line, { leadNewline = false } = {}) => {
+  const writeSideChannel = (line, { leadNewline = false, silent = false } = {}) => {
+    // 【focus 静默】专注视图下工具行/结果行整条丢弃。
+    // 注意 silent 与「写空串」的区别：这里连 emit('\n') 都不发，
+    // 否则 focus 里每来一个工具就多一行空白，反而更吵。
+    // mdRenderer 也不 flush —— 正文会紧接着继续流，提前 end 会把
+    // 同一段 markdown 切成两段（代码块被拦腰截断）。
+    if (silent) return
     if (mdRenderer) {
       try { mdRenderer.end() } catch {}
       // end() 内部已 reset；下一段正文会 ensureMdRenderer() 新建
@@ -1927,6 +2119,12 @@ async function main() {
   registry.register(new QQPushTool(qqBridge))
   // QQRecall：群消息不自动注入会话，靠这个工具主动回溯（「群里那个鸡蛋」）
   registry.register(new QQRecallTool(qqBridge))
+  // 【2026-10-22 ToolSearch】必须放在**所有 register 之后**（含下面 5159 的
+  // CommandExec、以及 MCP 运行时注册），否则后注册的工具永远不被标记延迟。
+  // applyDeferredTools 做的是「归一」：白名单 DEFERRED_TOOLS 是唯一真相源，
+  // 工具自己带的 shouldDefer 标记一律失效（避免延迟 SendMessage 这类核心通道）。
+  applyDeferredTools(registry)
+  registry.register(new ToolSearchTool({ getRegistry: () => registry }))
   // QQ 配置持久化到 ~/.claude-code-mobile/qq-config.json
   //
   // 【2026-09-24 改用共享模块】原来这里是本地实现，直接读写一维结构。
@@ -1954,6 +2152,11 @@ async function main() {
     useStream: () => config.stream !== false,
     onTurnLimitApproaching: (turns, max) => {
       const msg = `${C.yellow}⚠ 轮数提醒${C.reset} 已执行 ${turns}/${max} 轮。AI 会先自查是否在空转：有实质进展会自动进 deep 模式继续，空转则收尾汇报；也可手动 ${C.claude}/deep${C.reset}。`
+      try { safePrintAbove(msg + '\n') } catch { try { process.stdout.write(msg + '\n') } catch {} }
+    },
+    // 自动续轮提示（agent.mjs 到 maxTurns 自动续，最多 3 次）
+    onAutoContinue: (n, max) => {
+      const msg = `${C.yellow}⚠ 自动续轮${C.reset} 第 ${n}/${max} 次 —— Ctrl+C 可停。`
       try { safePrintAbove(msg + '\n') } catch { try { process.stdout.write(msg + '\n') } catch {} }
     },
     // 每个 turn 结束就把这一段发回 QQ（用户要求「按 turn 发」）。
@@ -2033,6 +2236,15 @@ async function main() {
       // 默认显示（若 config.thinking.show === false 则静默）
       if (config.thinking?.show === false) return
       if (!text) return
+      // focus：思考正文不写进正文区，但**保留三态状态机** ——
+      // 用户看不见思考内容，至少得看得见「在思考 / 思考了 Ns」，
+      // 否则长思考时屏幕完全静止，像是卡死了。
+      // 不设 reasoningHeaderEmitted：退出 focus 后第一段思考会重新打「∴ Thinking…」头，
+      // 因为之前那些确实没显示过。
+      if (focusMode) {
+        thinkBegin()
+        return
+      }
       // 保留完整 thinking，但单独使用官方风格的 ∴ 标题和缩进区域。
       // 全屏 footer 仍显示动态状态；正文标题让完整 thinking 在历史滚屏中可辨认。
       if (!reasoningHeaderEmitted) {
@@ -2154,6 +2366,9 @@ async function main() {
       if (text == null) return
       if (LIVE_WINDOW_OFF) return
       if (!fsSession) return
+      // focus：参数预览框同样属于「工具细节」，不画。
+      // 放在 Bash 判断之前 —— Bash 本来就不开框，但 focus 要对所有工具一致。
+      if (focusMode) return
       // 【Bash 不做参数预览框】
       // 对齐 Kimi：它的 STREAMING_PREVIEW_STRING_FIELDS 只抽 command 一行短字段，
       // 从不给 Bash 画多行内容框。命令内容在「● Bash (...)」工具行已经能看到，
@@ -2263,6 +2478,10 @@ async function main() {
       // 窗口归属：谁先推进度谁占窗口；被别的工具占着时不抢（等它结束）。
       if (windowOwner && windowOwner !== tid) return
       windowOwner = tid
+      // focus：不画执行中的输出窗口。进度仍照常进 progressTails
+      // （结果行要用它），只是不上屏 —— 否则 focus 里会冒出一段段
+      // Bash 输出，正是用户想隐藏的东西。
+      if (focusMode) return
       if (!liveBlockOpen) {
         flushBodyBeforeWindow()   // 同上：开窗前先吐正文，否则正文会晚于窗口出现
         try { fsSession.beginLiveBlock(); liveBlockOpen = true } catch { return }
@@ -2331,7 +2550,7 @@ async function main() {
       const toolSummary = row.summary ? ` (${row.summary})` : ''
       writeSideChannel(
         `${C.dim}●${C.reset} ${C.bold}${row.name}${C.reset}${toolSummary}\n${C.dim}  ${row.name}…${C.reset}\n`,
-        { leadNewline: true }
+        { leadNewline: true, silent: focusMode }
       )
       // 写入后回推行号：刚写的是两行（工具行 + 「  Name…」进度行），
       // 所以工具行 = 总行数 - 2，占位行 = 总行数 - 1。
@@ -2340,10 +2559,13 @@ async function main() {
       // 【按 block.id 存】同一轮可并发多个工具（agent 用 Promise.all 并行），
       // 用单个全局变量会被后一个覆盖 → 前一个结果到达时找不到自己的行。
       // key 缺失（老调用路径）时退回一个合成 key，至少不影响单个工具的场景。
+      //
+      // 【focus 下记 -1】没写就没行可改。记成 -1 让 onToolResult 的
+      // `progressIdx >= 0` 判据自然跳过就地写回，不必在那边再加一个 focus 分支。
       const tid = block?.id || `__anon_${row.name}`
       toolLineMap.set(tid, {
-        lineIdx: fsSession ? fsSession.bodyLineCount() - 2 : -1,
-        progressIdx: fsSession ? fsSession.bodyLineCount() - 1 : -1,
+        lineIdx: fsSession && !focusMode ? fsSession.bodyLineCount() - 2 : -1,
+        progressIdx: fsSession && !focusMode ? fsSession.bodyLineCount() - 1 : -1,
         plain: `${row.name}${toolSummary}`,
         name: row.name,
       })
@@ -2353,7 +2575,12 @@ async function main() {
       // 截断回起点，连「● Write (xxx)」一起删掉 —— 症状就是「工具行又丢了」。
       // 这里重开一次块，把起点挪到工具行之后。
       // 为执行阶段的输出视窗重开块，起点已在工具行之后
-      if (fsSession) {
+      //
+      // 【focus 下不开块】不会往块里写任何东西（输出窗口和参数预览都被拦了），
+      // 开着只会让 beginLiveBlock 在正文中途补一个换行（见它的 _openLine 分支），
+      // 在专注视图里表现为正文被空行割开。liveBlockOpen 保持 false，
+      // onToolResult 的 endLiveBlock 判据自然跳过。
+      if (fsSession && !focusMode) {
         try { fsSession.beginLiveBlock(); liveBlockOpen = true } catch {}
       }
     },
@@ -2524,7 +2751,7 @@ async function main() {
         } catch { wroteInPlace = false }
       }
       if (!wroteInPlace && resultLines.length) {
-        writeSideChannel(resultLines.join('\n') + '\n')
+        writeSideChannel(resultLines.join('\n') + '\n', { silent: focusMode })
       }
       // 用完清理（成功写回或退回追加都要清，否则 Map 会一直涨）
       try { if (tid) toolLineMap.delete(tid) } catch {}
@@ -2575,15 +2802,21 @@ async function main() {
   // termux-wake-lock 本质是 am startservice 启动 TermuxService 持锁；
   // 如果 TermuxService 被系统杀，锁会断，且我们不知道。所以每 5 分钟：
   //   1. 重新调 termux-wake-lock（TermuxService 重启后自动重获锁）
-  //   2. 更新通知内容带时间戳（息屏后看通知能确认进程还活着）
-  // 注意：这只是代码侧尽力；电池白名单是系统层放行前提（/keepalive 有指引）
+  //   2. 确认 AudioTrack 保活进程还活着，掉了就重拉
+  //
+  // 【2026-10-22】加 AudioTrack 保活。实测只有它能让 PowerKeeper 的
+  // isAudioActive(10286) 返回 true，从而豁免息屏后的后台限制。
+  // wake-lock / 热点 / phantom / Doze 白名单 / Device Owner 电源豁免全部实测无效。
   const keepaliveTimer = setInterval(() => {
     acquireMainWakeLock()
-    // 文案不写「息屏挂机」：用户可能正看着屏幕，通知栏说他在息屏很别扭。
-    // 只报客观事实（进程活着 + 最近心跳时间 + 锁状态）。
-    showMainNotification('Claude Code 运行中', `心跳 ${new Date().toLocaleTimeString()} · wake-lock 已持有`)
+    ensureAudioTrackKeepalive()
   }, 5 * 60 * 1000)
   keepaliveTimer.unref?.()
+
+  // 启动时立刻拉一次，不用等 5 分钟
+  if (config.keepaliveAuto !== false) {
+    ensureAudioTrackKeepalive()
+  }
 
   // ── 启动恢复：对齐官方，区分「重启续接」与「手动启动」 ──
   //
@@ -2622,7 +2855,72 @@ async function main() {
   // 非重启（手动启动）→ 什么都不做：sessionId 是 817 行刚生成的随机值，
   // 缓存键也在 831 行同步过，天然就是一个干净的新对话。
   //
-  // ── 重启后的历史回放（2026-10-03）──
+  // ── 会话注册表（跨会话通信的地基，2026-10-20）──
+  // 把本进程登记到 ~/.claude-code-mobile/peer-sessions/<pid>.json，
+  // 让另一个 CCM 进程（Web 端）能看见这个会话、给它发消息。
+  // 不注册的话 ListSessions 里永远只有自己，SendMessagePeer 也找不到目标。
+  // 进程退出时自动删除（sessions.mjs 里挂了 process.on('exit')）。
+  // 失败不影响启动：注册表只是锦上添花，不能因为写不了文件就不让用 CLI。
+  try {
+    registerSession({
+      kind: 'cli',
+      sessionId,
+      cwd: process.cwd(),
+      name: sessionTitle || null,
+      permissionMode: permManager?.getMode?.() || 'default',
+    })
+  } catch {}
+
+  // ── 跨会话消息轮询（2026-10-20）──
+  //
+  // 对齐官方 InboxPoller（claude.js:1572100+，1 秒一次）。
+  //
+  // 【为什么必须有】sessions.mjs 的 sendToPeer 只是把消息写进对方的 inbox 文件。
+  // 而 agent 侧的 _deliverPeerMessages() 只在 _run() 循环**开头**读一次 ——
+  // 对方空闲（不在跑 run）时，消息就静静躺在文件里没人看。用户开两个标签页、
+  // 另一个在等输入，这边发过去的消息永远不出现。
+  //
+  // 【和 agent 侧的分工】这里是「叫醒」，不是「消费」：
+  //   · 用 peek:true 只检查有没有未读，**不标记已读**（标记是 agent 的活）
+  //   · 有未读且当前不忙 → 调 processInput 触发一轮，agent 那轮开头自然会读到
+  //   · 如果这里先把消息读掉并标已读，agent 就永远看不到了
+  //
+  // 【为什么 1 秒】官方同值。更短是空转（inbox 是文件，读一次有 stat 成本），
+  // 更长会让「发过去→对方屏幕出现」的延迟可感知。
+  const PEER_POLL_MS = 1000
+  let peerPollTimer = null
+  const startPeerPolling = () => {
+    if (peerPollTimer) return
+    peerPollTimer = setInterval(() => {
+      // 忙的时候不叫醒：正在跑的那轮结束时会自己读，抢着 processInput
+      // 只会把消息塞进排队队列，反而延迟处理。
+      if (processing) return
+      let unread = []
+      try {
+        unread = readPeerInbox({ sessionId, peek: true }) || []
+      } catch { return }
+      if (!unread.length) return
+      // 交给 processInput 走完整流程（排队/打断/看板刷新都复用现成逻辑）。
+      // prompt 里写清楚这是自动唤醒，免得模型以为是用户主动说话。
+      processInput(
+        `（跨会话消息 · 自动唤醒 · ${unread.length} 条待读）\n` +
+        `另一个会话给你发了消息，内容会在本轮开头自动注入。直接处理即可。`,
+        { silent: true }
+      ).catch(() => {})
+    }, PEER_POLL_MS)
+    // unref：定时器不该单独撑着进程不退出。用户 Ctrl+C 或 /exit 时
+    // 进程要能正常结束，不能因为还有个轮询 timer 就卡住。
+    if (typeof peerPollTimer.unref === 'function') peerPollTimer.unref()
+  }
+  const stopPeerPolling = () => {
+    if (peerPollTimer) { clearInterval(peerPollTimer); peerPollTimer = null }
+  }
+  startPeerPolling()
+  // 进程退出时清掉定时器（虽然 unref 已经保证不阻塞退出，
+  // 但显式清理能让 exit 路径更快、也避免 CI 里的假挂起）
+  try { process.on('exit', stopPeerPolling) } catch {}
+
+  //
   // 对齐官方：恢复的上下文要画到屏幕上，不能只塞进 agent.messages。
   // 攒成行、等 fsSession.start() 之后再写（enter() 会清屏，先写会被擦掉）。
   // 只在重启路径回放：手动启动是新对话，本来就没历史可放。
@@ -2670,8 +2968,6 @@ async function main() {
       process.stdout.write(`${C.yellow}⚠ 自动保活启动失败（检查 termux-api / ffmpeg；详情 /keepalive）${C.reset}\n`)
     }
   }
-  // 同上：不断言用户在不在看屏幕，只说进程状态
-  showMainNotification('Claude Code 运行中', 'wake-lock 已持有 · 息屏也会保持运行')
   if (!mainWake) {
     // 只留一行：细节（原因/影响）用 /keepalive 查，启动时铺三行太吵
     process.stdout.write(`${C.yellow}⚠ wake-lock 失败，息屏可能被冻结（详情 /keepalive）${C.reset}\n`)
@@ -2680,6 +2976,9 @@ async function main() {
 
   // 前面那些固定输出（已恢复会话/model/CLAUDE.md/自定义命令）都清掉了，
   // 这行分隔空白也就没意义了，留着反而在全屏界面顶部空一行。
+  // 清理历史遗留的「运行中」通知（老版本会发，升级后不该继续挂着）
+  hideMainNotification()
+
   const startTime = Date.now()
   let abortController = null
   let userInterrupted = false
@@ -2790,13 +3089,37 @@ async function main() {
     settings: 'config', provider: 'config', providers: 'config',
     q: 'exit', ls: 'load', sessions: 'load',
     reset: 'clear', cls: 'clear',
-    usage: 'cost', tokens: 'context', ctx: 'context',
+    // /usage 在官方 2.1.303 里是**正式命令**，aliases: ["cost", "stats"]。
+    // CCM 原来是反的（usage → cost），于是 /usage 只给 token 数、拿不到会话统计。
+    // 现在 cost/stats 都归一化到 usage 分支（该分支同时打印 token 统计与会话统计），
+    // 老习惯 /cost /stats 照常能用，只是内容变全了。
+    cost: 'usage', stats: 'usage',
+    tokens: 'context', ctx: 'context',
     'allowed-tools': 'permissions', perms: 'permissions',
     md: 'memory',
     bg: 'bg-list', jobs: 'bg-list',
     colors: 'font',
     img: 'image', pic: 'image',
     todo: 'todos',
+    // 官方 2.1.303：/rewind 的 aliases 是 ["checkpoint", "undo"]。
+    //   · checkpoint —— 纯别名，直接映射
+    //   · undo —— **不映射**：CCM 的 /undo 是独立命令（立即撤销最近一次改动，
+    //     一步到位），而 /rewind 是「列检查点 → 选一个恢复」（两步）。
+    //     映射过去等于把一步变两步，是行为退化。改为在 cmdRewind 里提供
+    //     `/rewind undo` 子命令，两种拼法都能到同一个动作。
+    checkpoint: 'rewind',
+    // 官方 2.1.303：/resume 的 aliases 是 ["continue"]。纯别名，无冲突 ——
+    // CCM 没有名为 continue 的命令，映射过去就是同一个「恢复会话」动作。
+    continue: 'resume',
+    // 官方 2.1.303：/code-review 是打包 skill，aliases 含 "review"。
+    // CCM 原来只有 /review（本地静态扫描）。保留实现，名字对齐官方：
+    // /code-review 是正式入口，/review 作别名（见 cmd-extensions 的 cmdCodeReview）。
+    review: 'code-review',
+    // 官方 2.1.303：/rename 的 aliases 是 ["name"]，但 **CCM 的 /name 已被占用**
+    // —— 它是「改 Provider 显示名」（与 /model /url /key 同一组快捷命令）。
+    // 映射会让那条命令彻底消失，而它在 Provider 管理里是刚需。
+    // 取舍：保留 /name 原语义，不做别名；/rename 无参时会提示当前标题与用法。
+    // （官方 /rename 的另一个目的是「改名后 /resume 能按名找」，CCM 已支持。）
   }
   // 注意：mem / tasks / font 都是【独立命令】，不要给它们建别名映射 ——
   // 曾把 mem 映射到 memory，直接把记忆目录管理命令覆盖没了。
@@ -2847,7 +3170,20 @@ async function main() {
     // sessionId / todos / incognitoMode 都是 let（会被 /new 改），必须 setter 回写。
     // fsSession 是 let 且 start() 前为 null —— 传函数，让模块每次取值。
     newSessionId: () => randomUUID().slice(0, 8),
-    setSessionId: (id) => { sessionId = id; syncSessionCacheKey() },
+    setSessionId: (id) => {
+      sessionId = id
+      syncSessionCacheKey()
+      // 跨会话注册表跟着会话走：/new /resume 之后，别的进程看到的应该是新会话。
+      // 不更新的话，Web 端发来的消息会投进一个已经不存在的 sessionId 的 inbox。
+      try {
+        registerSession({
+          kind: 'cli',
+          sessionId,
+          cwd: process.cwd(),
+          permissionMode: permManager?.getMode?.() || 'default',
+        })
+      } catch {}
+    },
     setTodos: (list) => { todos = list },
     setIncognito: (on) => { incognitoMode = !!on },
     fsSession: () => fsSession,
@@ -2867,9 +3203,12 @@ async function main() {
     existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync,
     // join 在 index.mjs 顶部已 import（node:path），直接透传
     join,
+    // /clear 之后要发一次 SessionStart（source: 'clear'）。
+    // 模块内不能直接 import hooks（Web 端有自己的一份），统一由 ctx 注入。
+    hookManager,
   })
 
-  // 会话操作杂项（/branch /rewind /copy /add-dir /review /plugins /x11）。
+  // 会话操作杂项（/branch /rewind /copy /review /plugins /x11）。
   // 2026-09-23 从 switch 搬进模块 —— 见 core/cmd-session-extra.mjs 的说明。
   const sessionExtraCommands = makeSessionExtraCommands({
     multiUndo,
@@ -2887,6 +3226,9 @@ async function main() {
     C,
     maskKey,
     get mcpClient() { return mcpClient },
+    // /mcp reconnect 用：重连后工具清单可能变了，要把新工具同步进 registry，
+    // 否则新工具要等下次 Ctrl+X 重启才可见（旧适配器还会指向已摘掉的 server）。
+    syncMcpTools,
   })
 
   // 生图配置（第一个带交互向导的迁移对象）。
@@ -2920,6 +3262,11 @@ async function main() {
     saveSession: () => saveSession(),
     newCompactAbort: () => { compactAbortController = new AbortController(); return compactAbortController },
     clearCompactAbort: () => { compactAbortController = null },
+    // 手动压缩也要触发 PreCompact/PostCompact —— 官方两条路径都触发
+    //（PreCompact schema 带 trigger: ["manual","auto"]）。原来只有自动压缩路径
+    // 调了 hook，用户手动 /compact 时配的 hook 一次都不会执行，
+    // 表现为「我配的压缩前备份脚本从来没跑过」，很难归因到"只有自动路径生效"。
+    hookManager,
   })
 
   // /mem —— 结构化记忆（跟管 CLAUDE.md 的 /memory 是两个命令）
@@ -3007,6 +3354,9 @@ async function main() {
     config,
     saveConfig,
     acquireMainWakeLock,
+    ensureAudioTrackKeepalive,
+    releaseAudioTrackKeepalive,
+    isAudioTrackKeepaliveRunning: () => !!(audioTrackProc && !audioTrackProc.killed),
     checkBatteryWhitelist,
     listCompactTrash, readCompactTrash, restoreCompactTrash, deleteCompactTrash,
     get agent() { return agent },
@@ -3014,6 +3364,14 @@ async function main() {
     skillLoader,
     readTtfFullName,
     cmdContext,
+    // /context all —— 上下文明细。三个数据源用 getter 惰性取：
+    // systemPrompt / registry 都在 handleCommand 之后才定型，传值会是 undefined。
+    cmdContextDetail: (ag, max) => cmdContextDetail(ag, max, {
+      systemPrompt: () => getCurrentSystemPrompt(),
+      toolSchemas: () => registry.list().map(t => ({ name: t.name, description: t.description, input_schema: t.input_schema })),
+      contextFiles: () => contextFiles,
+      skills: () => skillLoader.list(),
+    }),
     getMaxContext,
     setMaxContext,
     updateFsStatus,
@@ -3036,6 +3394,125 @@ async function main() {
     C,
     listTeams, teamOverview, formatTeamOverview, inboxCounts, deleteTeam,
     listTasks, listTaskLists, resetTaskList,
+  })
+
+  // 子 Agent 运维批（/list-agents /stop /subtask /fork）—— 对齐官方 2.1.303。
+  // 与 cmd-agents（角色卡管理）分开：那边管「有哪些角色」，这边管「现在谁在跑」。
+  const agentOpsCommands = makeAgentOpsCommands({
+    C,
+    get agent() { return agent },
+    listKeptAgents,
+    // 团队信息用 getter 惰性取：团队可能在会话中途才建，传值会永远是空的。
+    getTeamInfo: () => {
+      try {
+        const names = listTeams()
+        if (!names || names.length === 0) return null
+        // 取第一个团队（CCM 目前单会话单团队，多团队时 /team 里能切）
+        const ov = teamOverview(names[0]?.name || names[0])
+        return ov ? { team: ov.name, members: ov.members || [] } : null
+      } catch { return null }
+    },
+    // /subtask 与 /fork 都复用 Agent 工具的 execute —— 不另开一条 spawn 路径。
+    // 理由：Agent 工具已经处理了并发闸门、key 轮换、hook 生命周期、
+    // 后台任务注册、AgentMemory 类型隔离。重写一份必然漂移。
+    spawnSubAgent: async (payload) => {
+      try { return await subAgentTool.execute(payload) }
+      catch (e) { return `派发失败：${e?.message || e}` }
+    },
+  })
+
+  // 界面 / 会话体验批（/theme /tui /scroll-speed /keybindings /version
+  // /release-notes /recap /focus /cd）—— 对齐官方 2.1.303。
+  const uxCommands = makeUxCommands({
+    C,
+    config,
+    saveConfig,
+    CLI_VERSION,
+    getMarkdownTheme,
+    setMarkdownTheme,
+    markdownThemeNames,
+    getMaxContext,
+    setMaxContext,
+    fsSession: () => fsSession,
+    // /focus 的真正开关在 index.mjs（拦截点在渲染出口），命令层只读写它。
+    getFocusMode: () => focusMode,
+    setFocusMode: (v) => { focusMode = !!v },
+    get agent() { return agent },
+    // /version 要能分辨「磁盘上已是新版但进程里还是旧的」（/update 之后常见）
+    diskVersion: () => {
+      try {
+        return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8')).version || CLI_VERSION
+      } catch { return CLI_VERSION }
+    },
+    // /recap 要真发一次请求（不拿旧消息充数）。走独立的临时 Agent：
+    // 复用主 agent 会把 recap 的提问写进主历史，污染上下文。
+    runAgent: async (prompt, opts = {}) => {
+      const { Agent } = await import('./core/agent/agent.mjs')
+      const history = agent.getHistory()
+      // 只取最近 30 条做素材，且**不回写**主历史
+      const recent = history.slice(-30).map((m) => {
+        const role = m?.role === 'assistant' ? '助手' : m?.role === 'user' ? '用户' : '工具'
+        const c = m?.content
+        let text = ''
+        if (typeof c === 'string') text = c
+        else if (Array.isArray(c)) text = c.map(b => (typeof b === 'string' ? b : (b?.text || ''))).filter(Boolean).join('\n')
+        return String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400)
+      }).filter(Boolean).map((t, i) => `${i + 1}. ${t}`).join('\n')
+      let out = ''
+      const tmp = new Agent({
+        api,
+        visionApi,
+        systemPrompt: '你是一个摘要器。只按要求输出，不要客套、不要解释。',
+        tools: [],
+        maxTurns: 1,
+        onText: (t) => { out += t },
+        useStream: false,
+        traceEnabled: false,
+      })
+      await tmp.run(`这是一段会话记录：
+${recent}
+
+${prompt}`)
+      return out
+    },
+    // /cd 切目录后要重建系统提示词（提示词里写着「工作目录: xxx」）
+    onWorkspaceChange: () => { try { invalidateAllSections() } catch {} },
+  })
+
+  // 诊断 / 统计批（/skill-doctor /reload-skills /insights /import）
+  const diagCommands = makeDiagCommands({
+    C,
+    config,
+    saveConfig,
+    skillLoader,
+    // 本会话展开过的 skill 名 —— SkillTool 展开时会登记到 activeSkills
+    usedSkills: () => activeSkills,
+    getMaxContext,
+    get agent() { return agent },
+    listMemories,
+    listKeptAgents,
+    getRunningSubagents,
+    // /import 写 MCP 配置用
+    mergeMcpServers: (servers) => {
+      const p = MCP_PATH
+      let cfg = { mcpServers: {} }
+      try { cfg = JSON.parse(readFileSync(p, 'utf-8')) } catch {}
+      if (!cfg.mcpServers) cfg.mcpServers = {}
+      let added = 0, kept = 0
+      for (const [name, def] of Object.entries(servers)) {
+        if (cfg.mcpServers[name]) { kept++; continue }   // 同名不覆盖
+        cfg.mcpServers[name] = def
+        added++
+      }
+      atomicWrite(p, JSON.stringify(cfg, null, 2) + '\n')
+      return `MCP: 新增 ${added} 个${kept ? `，已存在跳过 ${kept} 个（不覆盖）` : ''}`
+    },
+    appendProjectMemory: (text) => {
+      const p = join(DATA_DIR, 'CLAUDE.md')
+      const cur = existsSync(p) ? readFileSync(p, 'utf-8') : ''
+      atomicWrite(p, cur + text)
+      try { invalidateAllSections() } catch {}
+    },
   })
 
   // /permissions —— 改模式后必须重建系统提示词（提示词里写着当前模式）
@@ -3161,12 +3638,16 @@ async function main() {
         //（CLI 版有 50 份上限和 tokenUsage，Web 版没有）。现在两端调同一个函数。
         return sessionCommands.clear()
       }
+      case 'clear-history': {
+        // 原 /clear 的「清空但保留 sessionId」行为，2026-10-22 让位给官方语义后改名。
+        return sessionCommands['clear-history']()
+      }
       case 'clear-restore': {
         // 同 /clear：实现搬到 core/cmd-queries.mjs，两端共用。
         return sessionCommands['clear-restore'](args)
       }
       case 'new': {
-        // 实现搬到 core/cmd-queries.mjs，两端共用（见 /clear 的说明）。
+        // 官方 /clear 的别名（aliases: ["reset","new"]），与 /clear 等价。
         return sessionCommands.new()
       }
       case 'incognito': {
@@ -3409,8 +3890,11 @@ async function main() {
       }
 
       // 已拆分 → core/cmd-queries.mjs
-      case 'cost':
-        return queryCommands.cost()
+      // /usage 是正式入口（官方 2.1.303 把 cost/stats 降为它的别名）。
+      // /cost 与 /stats 在 handleCommand 入口已被 COMMAND_ALIASES 归一化成
+      // usage，所以这里只需要一个 case —— 原来那两个 case 现在不可达。
+      case 'usage':
+        return queryCommands.usage()
 
       case 'cache':
         // 【2026-10-05 搬】实现移到 core/commands/cmd-system-config.mjs，
@@ -3452,9 +3936,53 @@ async function main() {
         return r
       }
 
-      case 'plan':
+      case 'plan': {
+        // 官方 2.1.303：description "Enable plan mode or view the current session plan"，
+        // argumentHint `[open|<description>]`。CCM 原来只有无参 toggle，
+        // 敲 `/plan open` 会被当成「toggle 一次」—— 参数被静默丢弃，
+        // 用户以为打开了计划视图，实际只是把模式翻了个面。
+        const sub = String(args[0] || '').trim()
+        const subLow = sub.toLowerCase()
+        if (subLow === 'open') {
+          // 看当前计划。CCM 没有「会话计划文档」实体，计划就是本会话里
+          // 模型给出过的步骤列表 + TodoWrite 的清单。这里如实汇报这两处，
+          // 而不是造一个空的「计划视图」。
+          const todoList = (() => {
+            try { return Array.isArray(todos) ? todos : [] } catch { return [] }
+          })()
+          const lines = [
+            `${C.bold}计划模式${C.reset}: ${planMode.enabled ? '已启用' : '未启用'}`,
+          ]
+          if (todoList.length) {
+            lines.push('', `${C.bold}当前待办${C.reset}（${todoList.length} 项）:`)
+            for (const t of todoList) {
+              const mark = t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '→' : '○'
+              lines.push(`  ${mark} ${t.content || t.activeForm || ''}`)
+            }
+          } else {
+            lines.push('', `${C.dim}当前会话没有待办清单。模型给出计划后，这里会列出它的步骤。${C.reset}`)
+          }
+          lines.push('', `${C.dim}CCM 没有独立的「计划文档」—— 计划就是对话里给出的步骤列表。${C.reset}`)
+          return lines.join('\n')
+        }
+        if (sub && subLow !== 'off' && subLow !== 'on') {
+          // 带描述启动：官方语义是「以这段描述作为计划目标进入计划模式」。
+          // 这里开启计划模式，并把描述作为首轮指令交给 agent —— 这样
+          // `/plan 重构 tools.mjs` 一次到位，不用再敲第二遍。
+          agent.systemPrompt = getCurrentSystemPrompt()
+          const wasEnabled = planMode.enabled
+          if (!wasEnabled) planMode.enable()
+          return await processInput(
+            `【计划模式】先给出执行计划（步骤列表），不要执行任何工具，等我批准：\n${sub}`
+          )
+        }
+        if (subLow === 'on' || subLow === 'off') {
+          agent.systemPrompt = getCurrentSystemPrompt()
+          return subLow === 'on' ? planMode.enable() : planMode.disable()
+        }
         agent.systemPrompt = getCurrentSystemPrompt()
         return planMode.toggle()
+      }
 
       case 'deep':
         // /deep 切换 deep 模式（轮数上限见 core/plan.mjs 的 DEEP_MAX_TURNS）
@@ -3541,8 +4069,45 @@ async function main() {
         return results.length > 0 ? results.join('\n') : '没有可撤销的操作'
       }
 
+      // /export：官方是交互式选「复制到剪贴板 / 保存到文件」
+      //（split/out/src/chunk-5b1h5pgx.js 的选项面板），终端里改成参数式。
+      // 参数名选 --clipboard：官方那个选项的 value 就叫 "clipboard"，
+      // 而 --copy 容易和隔壁 /copy（复制最后一条回复）混起来。
       case 'export': {
-        const file = args[0] || `对话-${Date.now()}.md`
+        const raw = args.map(a => String(a))
+        const clipFlag = raw.find(a => /^--?(clipboard|clip)$/i.test(a))
+        const rest = raw.filter(a => !/^--?(clipboard|clip)$/i.test(a))
+
+        // 未知的 --flag 不能当文件名落盘：`/export --copy` 会静默生成一个
+        // 名字叫 "--copy" 的垃圾文件，用户完全看不出发生了什么。
+        const badFlag = rest.find(a => /^--?[a-z]/i.test(a))
+        if (badFlag) {
+          return `未知参数「${badFlag}」\n用法: /export [文件]              导出到文件（md/html/json）\n      /export --clipboard [格式]   复制到剪贴板（不落盘）`
+        }
+
+        if (clipFlag) {
+          // 格式：--clipboard 后可跟 md/html/json；带点的 `.json` 和 `x.json` 也认
+          //（用户很自然会照着文件名写）
+          const fmtRaw = String(rest[0] || 'md')
+            .replace(/^.*\./, '')   // 剥掉任何目录/文件名前缀
+            .toLowerCase()
+          const fmt = ['md', 'markdown'].includes(fmtRaw) ? 'md'
+            : ['html', 'htm'].includes(fmtRaw) ? 'html'
+            : fmtRaw === 'json' ? 'json' : null
+          if (!fmt) {
+            return `用法: /export --clipboard [md|html|json]\n  不支持格式「${rest[0]}」（html 贴进纯文本框会是一堆标签，除非你确实要）`
+          }
+          const text = Exporter.toText(agent.getHistory(), fmt)
+          try {
+            const r = await Exporter.copyToClipboard(text)
+            // 剪贴板不是文件，不受 incognito 的「禁写保护目录」限制 —— 它不落盘
+            return `已复制到剪贴板（${fmt} · ${r.chars} 字符）`
+          } catch (e) {
+            return `导出到剪贴板失败：${e?.message || String(e)}`
+          }
+        }
+
+        const file = rest[0] || `对话-${Date.now()}.md`
         if (incognitoMode && isProtectedPath(file)) return 'Incognito 禁止写入 claude-code-mobile'
         Exporter.save(agent.getHistory(), file)
         return `已导出到 ${file}`
@@ -3553,12 +4118,25 @@ async function main() {
       // 让当前会话立刻生效，不用重启。
       case 'pexels':
         return await integrationCommands.pexels(args)
+
+      // 【2026-10-20】/tvly 与 /pexels 同批实现（cmd-integrations.mjs），
+      // 目录（command-catalog.mjs:44/68/193）也登记了，但 switch 里漏了这个 case ——
+      // 结果 /tvly 一直是「未知命令」，属于目录里看得见、敲了却没反应的幽灵命令。
+      case 'tvly':
+        return await integrationCommands.tvly(args)
+      // ── /connectors：连接器总览（GitHub / QQ / MCP / 邮箱 的统一入口）────
+      // 判定逻辑全在 core/integrations/connectors.mjs（Web 的 /api/connectors/status
+      // 也读它）——这里只负责把活的 mcpClient 传进去，否则 MCP 那栏只能报
+      // 「运行状态未知」（拿不到 servers Map 就没法区分「配了没连上」和「在跑」）。
+      case 'connectors':
+        return integrationCommands.connectors(args)
       // ── /mcp：管理 MCP 服务器（对齐官方 commands/mcp）────────────────
       // 官方定位是 'Manage MCP servers'，argumentHint '[enable|disable [server-name]]'。
       // MCP 的**工具**不做成 slash 命令（走 mcp_<server>_<tool> 工具通道），
       // 这个命令只管服务器的启停与状态查看。
       case 'mcp':
-        return integrationCommands.mcp(args)
+        // await：reconnect 要真的重新 spawn + 握手（异步）
+        return await integrationCommands.mcp(args)
       // ── /plugin：管理插件（对齐官方 Claude Code 的 /plugin）────────────
       // 官方定位是 'Manage plugins'，管的是 Claude Code 插件市场里的插件。
       // CCM 的插件体系是 DSH 生态（Cordis 插件框架），通过 dsh-host 兼容层加载。
@@ -3618,8 +4196,91 @@ async function main() {
         return teamTaskCommands.team(args)
 
 
-      case 'tasks':
-        return teamTaskCommands.tasks(args)
+      case 'tasks': {
+        // 【2026-10-22 语义对齐】官方 /tasks（aliases: ["bashes"]）是
+        // "View and manage everything running in the background" —— 管**后台进程**。
+        // CCM 原来把 /tasks 给了「持久化待办清单」，与官方语义直接冲突：
+        // 用户按官方习惯敲 /tasks 想看后台跑着什么，拿到的是任务列表。
+        // 现在 /tasks 管后台进程（/bg-list /bg-status 的合并入口，那两个照旧可用），
+        // 持久待办改叫 /tasklist。
+        //
+        // 为什么做成合并入口而不是纯别名：官方的 /tasks 能看能停（"manage"），
+        // 只有 list 没有 stop 会丢掉一半语义。kill 复用 killBackgroundTask。
+        const sub = String(args[0] || '').toLowerCase()
+        const list = listBackgroundTasks()
+
+        if (!sub || sub === 'list' || sub === 'all') {
+          if (!list.length) return '(无后台任务)\n子 Agent 用 Agent(run_in_background) 启动 · Bash 用 run_in_background'
+          const running = list.filter(t => t.status === 'running')
+          const lines = list.map(t => {
+            const dur = t.duration_ms ? ` ${(t.duration_ms / 1000).toFixed(1)}s` : ''
+            const turns = t.maxTurns ? ` turn ${t.turns}/${t.maxTurns}` : (t.turns ? ` turn ${t.turns}` : '')
+            const name = t.agentName || t.description || ''
+            return `  ${t.id}  ${t.status.padEnd(9)} ${String(t.type || '').padEnd(11)}${dur}${turns}` +
+              (name ? `  ${name}` : '')
+          })
+          return `后台任务（共 ${list.length} · 运行中 ${running.length}）\n${lines.join('\n')}\n\n` +
+            `用法: /tasks <id> 看详情 · /tasks stop <id|名字> 中止（已结束的由 GC 自动清理）`
+        }
+
+        if (sub === 'stop' || sub === 'kill') {
+          const target = args[1]
+          if (!target) return '用法: /tasks stop <任务ID|agent名字>'
+          // 先按 id 找，找不到再按名字反查（对齐 AgentStop 的宽容度：
+          // 用户记住的通常是 worker-1 这种名字，不是 a1b2c3d4）
+          let task = list.find(t => t.id === target)
+          if (!task) {
+            // ⚠ findTaskByName 返回的是**内部 task 对象**，上面没挂 id
+            //（id 是 Map 的 key，不是 task 的字段）。直接读 task.id 会得到
+            // undefined → killBackgroundTask(undefined) 静默失败，
+            // 用户看到「中止失败: undefined」。所以按名字命中后要用
+            // agentName/description 回列表里把带 id 的那条捞回来。
+            const byName = findTaskByName(target)
+            if (byName) {
+              task = list.find(t => t.agentName === byName.agentName && t.description === byName.description)
+                || list.find(t => t.description === byName.description)
+            }
+          }
+          if (!task) return `未找到任务: ${target}`
+          if (task.status !== 'running' && task.status !== 'pending') {
+            return `任务 ${task.id} 已是终态（${task.status}），无需中止`
+          }
+          const ok = killBackgroundTask(task.id)
+          return ok ? `已中止: ${task.id}${task.agentName ? ` (${task.agentName})` : ''}` : `中止失败: ${task.id}`
+        }
+
+        // 带 id：看详情，等价 /bg-status <id>
+        const one = list.find(t => t.id === sub)
+        if (one) {
+          const status = getBackgroundTaskStatus(one.id)
+          return status ? JSON.stringify(status, null, 2) : `未找到任务: ${sub}`
+        }
+        return `用法: /tasks [list|all] · /tasks <id> 看详情 · /tasks stop <id|名字>`
+      }
+
+      case 'tasklist':
+        // 持久化任务清单（TaskCreate 建的那些，跨重启存活）。
+        // 原名叫 /tasks，2026-10-22 改名让出 /tasks 给后台进程语义。
+        return teamTaskCommands.tasklist(args)
+
+      // ── 子 Agent 运维（对齐官方 2.1.303）──────────────────────────────
+      // /list-agents  官方 aliases: ["peers"] —— 运行中 / 可唤醒 / 队友 三类合一
+      // /stop         官方语义是「停掉后台会话」，CCM 映射到后台子 agent
+      // /subtask      带全对话上下文派子 agent，结果回主对话（同步）
+      // /fork         继承全对话派后台 agent，主对话不受影响（异步）
+      // 注意 /stop 与 KillShell（Bash 后台任务）不是一回事：
+      // 这里停的是子 agent，虽然 local_bash 类型也能停，但主语义在 agent。
+      case 'list-agents': case 'peers':
+        return agentOpsCommands['list-agents'](args)
+
+      case 'stop':
+        return await agentOpsCommands.stop(args)
+
+      case 'subtask':
+        return await agentOpsCommands.subtask(args)
+
+      case 'fork':
+        return await agentOpsCommands.fork(args)
 
 
       case 'context':
@@ -3659,7 +4320,18 @@ async function main() {
         return queryCommands.files(args)
 
       // 一屏状态汇总（官方 /status）
+      // 官方 status 是交互面板，CCM 输出文本。/status probe 额外做一次 API 连通性
+      // 探测 —— 默认不探测：/status 是「看一眼」的命令，不该被网络往返拖住。
       case 'status': {
+        const sub = String(args[0] || '').toLowerCase()
+        let connectivity = null
+        if (sub === 'probe') {
+          connectivity = await probeApiConnectivity({
+            probe: (timeoutMs) => api?.testConnection?.(timeoutMs) ?? Promise.resolve({ ok: false, error: '当前没有可用的 API 客户端' }),
+          })
+        } else if (sub && sub !== 'probe') {
+          return `用法: /status          查看状态（不联网，秒回）\n      /status probe    额外探测当前 Provider 的 API 连通性（最多 ${PROBE_TIMEOUT_MS}ms）`
+        }
         const report = buildStatusReport({
           version: CLI_VERSION,
           model: config.model,
@@ -3670,6 +4342,7 @@ async function main() {
           thinkingPolicy: api?.describeThinkingPolicy?.() || '',
           keys: api?.describeKeys?.() || null,
           toolCount: registry.list().length,
+          connectivity,
           mcpServers: (() => {
             try {
               return [...(mcpClient?.servers || new Map())].map(([name, srv]) => ({
@@ -3704,14 +4377,18 @@ async function main() {
           // 无参数 → select 列表直接选，不再打印一段用法让用户重敲
           const tp = config.providers?.[config.current]?.thinking
           const t = tp || config.thinking || {}
-          const cur = t.enabled ? (t.effort || 'high') : 'off'
+          // effort 未显式设置 = auto（用模型默认档位），不能显示成 high ——
+          // 否则用户看到的「当前 high」和实际发出去的请求对不上。
+          const cur = t.enabled ? (t.effort || 'auto') : 'off'
           const scope = tp ? `Provider ${config.current} 独立配置` : '全局默认'
           const replayOn = t.replay === true
           const hints = {
             none: '不思考，最快', minimal: '极少思考', low: '简单任务',
             medium: '平衡', high: '复杂任务（推荐）', xhigh: '很深', max: '最深，最慢',
+            auto: '不指定档位，用模型自己的默认值',
           }
           const items = [
+            { value: 'auto', label: 'auto', hint: `${hints.auto}${cur === 'auto' ? '  ← 当前' : ''}` },
             ...valid.map(v => ({ value: v, label: v, hint: `${hints[v] || ''}${v === cur ? '  ← 当前' : ''}` })),
             { value: 'off', label: 'off', hint: `关闭思考${cur === 'off' ? '  ← 当前' : ''}` },
             { value: 'show', label: 'show', hint: '显示思考内容' },
@@ -3758,6 +4435,22 @@ async function main() {
         if (level === 'off') {
           thinking.enabled = false
           if (api) { api.thinkingConfig = null; api.clearThinkingCompatibilityFallback?.() }
+        } else if (level === 'auto') {
+          // 官方语义（chunk-6jwsqnf1.js:fn32341 与 fn8816）：
+          //   auto / unset → { value: undefined }，即**删掉**显式档位，
+          //   回落到模型自己的默认值，而不是挑一个具体档位。
+          // 帮助文本同文件 fn12583 写的是 "auto: Use the default effort level for your model"。
+          // 所以这里删字段而不是写 'high' —— 写死 high 就成了「用 high」，不是 auto。
+          thinking.enabled = true
+          delete thinking.effort
+          // api 侧：effort 缺失时 getThinkingPolicy 会回落到 'high'
+          // （core/api/api.mjs:656）。那是 CCM 的兜底档位，与官方 auto
+          // 的「模型默认」不是一回事，但请求里不带 effort 字段时服务端
+          // 本来就会用自己的默认值 —— 只要别把 effort 塞进请求体就行。
+          if (api) {
+            api.thinkingConfig = { enabled: true }
+            api.clearThinkingCompatibilityFallback?.()
+          }
         } else if (level === 'show' || level === 'hide') {
           thinking.show = level === 'show'
         } else if (valid.includes(level)) {
@@ -3765,10 +4458,14 @@ async function main() {
           thinking.effort = level
           if (api) { api.thinkingConfig = { enabled: true, effort: level }; api.clearThinkingCompatibilityFallback?.() }
         } else {
-          return `不认识的档位: ${level}\n可用: ${valid.join(' / ')} / off / show / hide / replay on|off`
+          return `不认识的档位: ${level}\n可用: auto / ${valid.join(' / ')} / off / show / hide / replay on|off`
         }
         saveConfig(config)
-        const label = level === 'off' ? '思考已关闭' : level === 'show' ? '思考内容将在终端显示' : level === 'hide' ? '思考内容将不在终端显示（仍发送给模型）' : `思考强度已设为: ${level}`
+        const label = level === 'off' ? '思考已关闭'
+          : level === 'auto' ? '思考强度已设为 auto（不指定档位，由模型自己的默认值决定）'
+          : level === 'show' ? '思考内容将在终端显示'
+          : level === 'hide' ? '思考内容将不在终端显示（仍发送给模型）'
+          : `思考强度已设为: ${level}`
         // 不再跟一行「实际请求」：describeThinkingPolicy() 对不在白名单的模型
         // （api.mjs:321 claude 系、334 未知模型）永远返回同一句“已安全省略”，
         // 无论设 max 还是 low 都不变，又跟上一行“已设为 xxx”自相矛盾。
@@ -3905,8 +4602,14 @@ async function main() {
         // 【2026-10-05 搬】实现移到 core/commands/cmd-system-config.mjs。
         return await systemConfigCommands.check(args)
 
+      // /review 已在 COMMAND_ALIASES 里归一化成 code-review，
+      // 这个 case 只作为「别名表被改动时的兜底」保留 —— 两条路都到同一份实现。
       case 'review':
         return sessionExtraCommands.review(args)
+
+      // /code-review —— 官方 2.1.303 的正式名（/review 是别名）
+      case 'code-review':
+        return sessionExtraCommands['code-review'](args)
 
       case 'plugins':
         // 【2026-10-04 改】原来是 cmd-extensions 的空壳插件系统（listPlugins 永远返回空）。
@@ -3952,8 +4655,7 @@ async function main() {
         // 详情表（当前 Provider 全字段 + key 池状态 + 可用列表 + 命令速查）。
         if (args[0] === 'list') args[0] = 'show'
         if (!args.length) return await runProviderSelect()
-        const _r = cmdConfig(args, config, api, saveConfig, (provider, activeApi) => {
-          setVisionConfig(provider, activeApi, config.providers?.[config.visionProviderId || '6'] || null)
+        const _r = cmdConfig(args, config, api, saveConfig, (provider, activeApi) => {          setVisionConfig(provider, activeApi, config.providers?.[config.visionProviderId || '6'] || null)
           // 图片直注入 Agent 的实际 API 必须跟随 vision 路由：当前 Provider 关闭 vision 时，
           // 用备用 Opus API；不能仍传 activeApi，否则图片会发给不支持 vision 的当前模型。
           const visionOn = provider?.vision === true
@@ -3971,7 +4673,7 @@ async function main() {
               protocol: fallbackProvider.protocol || 'openai',
               maxTokens: fallbackProvider.maxTokens || config.maxTokens,
               temperature: fallbackProvider.temperature ?? config.temperature,
-              thinkingConfig: fbT.enabled ? { enabled: true, effort: fbT.effort || 'high' } : null,
+              thinkingConfig: fbT.enabled ? { enabled: true, ...(fbT.effort ? { effort: fbT.effort } : {}) } : null,
               replayReasoning: fbT.replay === true,
             })
             setVisionApi(fallbackApi)
@@ -3980,6 +4682,12 @@ async function main() {
             setVisionApi(activeApi)
             agent?.setVisionApi?.(activeApi)
           }
+        }, {
+          // /config permissionMode=xxx 需要**同时**改运行中的 PermissionManager：
+          // 只写 config.json 的话当轮仍按旧模式裁决（写盘成功但行为没变，最难查）。
+          hooks: {
+            setPermissionMode: (mode) => permManager.setMode(mode),
+          },
         })
         // /config model|url 统一转发到 /model|/url（避免两份实现漂移）。
         // 这段原来躺在那个不可达分支里，等于 /config model 一直是坏的。
@@ -3997,10 +4705,79 @@ async function main() {
 
       case 'hooks': {
         if (incognitoMode) return 'Incognito 会话禁用 /hooks'
-        const events = ['SessionStart','SessionEnd','UserPromptSubmit','PreToolUse','PostToolUse','PreCompact','PostCompact','Stop']
+        // 事件清单以 hooks.mjs 文件头为准。SubagentStart/SubagentStop 从 2026-09
+        // 起就有真实触发点（plan.mjs），但这里一直没列 —— 用户 /hooks 看不到，
+        // 以为不支持。声明与实现必须同步，否则等于把可用能力藏起来。
+        const events = ['SessionStart','SessionEnd','UserPromptSubmit','PreToolUse','PostToolUse','PostToolUseFailure','PreCompact','PostCompact','Stop','SubagentStart','SubagentStop','PermissionDenied']
+        const sub = String(args[0] || '').trim().toLowerCase()
+
+        // ── /hooks edit：调 $EDITOR 打开 hooks.json，保存后校验 + 热重载 ──
+        //
+        // 【为什么是「打开整份文件」而不是 add/rm 子命令】
+        // hooks.json 的结构是 {事件: [{matcher, hooks:[{type,command,timeout}]}]}，
+        // 嵌套三层。用命令行拼这个结构要处理转义、合并、序号定位，
+        // 每一处都能写错，而写错的后果是**hook 静默失效**（不报错、就是不触发）。
+        // 交给编辑器改是零风险的：用户看到的就是最终 JSON。
+        //
+        // 【失败必须保住内存里的旧配置】reload() 解析失败时**不动** this.hooks，
+        // 所以本轮会话的 hook 照常工作；坏掉的是磁盘文件，要明确告诉用户去修。
+        // 反过来（直接 this.hooks = {}）会让用户以为"保存成功了但 hook 全没了"。
+        if (sub === 'edit') {
+          if (!hookManager || typeof hookManager.reload !== 'function') {
+            return 'hookManager 未初始化，无法编辑。'
+          }
+          // 文件不存在时先落一份空骨架：让用户看到合法结构，而不是对着空白文件猜。
+          if (!existsSync(HOOKS_PATH)) {
+            try {
+              mkdirSync(dirname(HOOKS_PATH), { recursive: true })
+              writeFileSync(HOOKS_PATH, '{}\n', 'utf-8')
+            } catch (e) {
+              return `无法创建 ${HOOKS_PATH}: ${e.message}`
+            }
+          }
+          // 先把改动前的内容读出来：编辑后用它判断「到底改了没」，
+          // 没改就不做无谓的重载，也不给用户「已保存」的错觉。
+          let before = ''
+          try { before = readFileSync(HOOKS_PATH, 'utf-8') } catch {}
+          const editor = process.env.CCM_EDITOR || process.env.VISUAL || process.env.EDITOR || 'vi'
+          try {
+            execFileSync(editor, [HOOKS_PATH], { stdio: 'inherit', timeout: 30 * 60 * 1000 })
+          } catch (e) {
+            // 编辑器非零退出（vim 的 :cq、用户中断等）不代表文件坏了，
+            // 仍然走下面的校验路径 —— 用户可能已经存过盘了。
+            if (e?.status == null) return `无法启动编辑器 ${editor}: ${e.message}`
+          }
+          let after = ''
+          try { after = readFileSync(HOOKS_PATH, 'utf-8') } catch (e) {
+            return `编辑后读取失败: ${e.message}`
+          }
+          if (after === before) {
+            const cur = hookManager.getAllHooks?.() || {}
+            const n = Object.values(cur).reduce((a, v) => a + (Array.isArray(v) ? v.length : 0), 0)
+            return `hooks.json 未改动（当前生效 ${n} 条）。`
+          }
+          const r = hookManager.reload()
+          if (!r.ok) {
+            return [
+              `${C.red}hooks.json 校验失败，已保留旧配置${C.reset}`,
+              `  ${r.error}`,
+              '',
+              `${C.dim}当前会话仍按**修改前**的 ${Object.keys(hookManager.getAllHooks?.() || {}).length} 个事件生效。`,
+              `磁盘上的文件是坏的 —— 修好它再 /hooks edit，或 git checkout 还原。${C.reset}`,
+              `文件: ${HOOKS_PATH}`,
+            ].join('\n')
+          }
+          return [
+            `${C.green}hooks.json 已保存并热重载${C.reset}`,
+            `  ${r.events} 个事件 · ${r.entries} 条 hook`,
+            `${C.dim}立即生效，无需重启。${C.reset}`,
+          ].join('\n')
+        }
+
         let cfg = {}
         try { cfg = existsSync(HOOKS_PATH) ? JSON.parse(readFileSync(HOOKS_PATH, 'utf-8')) : {} } catch (e) { return `hooks.json 解析失败: ${e.message}` }
         return `Hooks: ${existsSync(HOOKS_PATH) ? HOOKS_PATH : '(未配置)'}\n` + events.map(event => `  ${event}: ${Array.isArray(cfg[event]) ? cfg[event].length : 0}`).join('\n')
+          + `\n\n${C.dim}编辑: /hooks edit（用 $EDITOR 打开，保存后自动校验并热重载）${C.reset}`
       }
 
       case 'tools':
@@ -4018,8 +4795,7 @@ async function main() {
         return teamTaskCommands.away(args)
 
 
-      case 'stats':
-        return queryCommands.stats()
+      // /stats 已归一化为 /usage 的别名（见 COMMAND_ALIASES），此 case 不可达。
 
       case 'memory': {
         if (incognitoMode) return 'Incognito 会话禁用 /memory'
@@ -4063,7 +4839,8 @@ async function main() {
 
 
       case 'copy':
-        return sessionExtraCommands.copy()
+        // /copy [N] —— N = 倒数第 N 条（官方：or /copy N for the Nth-latest）
+        return sessionExtraCommands.copy(args)
 
       case 'editor': {
         const dir = mkdtempSync(join(tmpdir(), 'ccm-editor-'))
@@ -4236,8 +5013,9 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
         }
       }
 
-      case 'add-dir':
-        return sessionExtraCommands['add-dir'](args)
+      // 【2026-10-22 删除 /add-dir】它从来没生效过：extraDirs 无消费方，
+      // CCM 也没有目录白名单（toolPath 只做 resolve）。详见 cmd-extensions.mjs。
+      // 想改工作目录用下面的 /workspace —— 那个是真的写 config.json + 注入提示词。
 
       case 'workspace':
         // 【2026-10-05 搬】实现移到 core/commands/cmd-system-config.mjs。
@@ -4289,6 +5067,53 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
 
       case 'keepalive':
         return await miscCommands.keepalive(args)
+
+
+      // ── 界面 / 会话体验批（uxCommands，构造于上方 makeUxCommands）─────────
+      // 【2026-10-20】这 9 个命令的实现一直存在、对象也构造了，但 switch 里
+      // 从来没有 case 引用它们 —— 敲 /theme 直接落到 default 的「未知命令」。
+      // 审计确认：`grep "uxCommands\." index.mjs` 为空，即全文零调用。
+      // 属「写完了没接线」，不是没实现。
+      case 'theme':
+        return uxCommands.theme(args)
+
+      case 'tui':
+        return uxCommands.tui(args)
+
+      case 'scroll-speed':
+        return uxCommands['scroll-speed'](args)
+
+      case 'keybindings':
+        return uxCommands.keybindings(args)
+
+      case 'version':
+        return uxCommands.version(args)
+
+      case 'release-notes':
+        return await uxCommands['release-notes'](args)
+
+      case 'recap':
+        return await uxCommands.recap(args)
+
+      case 'focus':
+        return uxCommands.focus(args)
+
+      case 'cd':
+        return uxCommands.cd(args)
+
+      // ── 诊断 / 统计批（diagCommands，构造于上方 makeDiagCommands）────────
+      // 同上：此前零调用。
+      case 'skill-doctor':
+        return diagCommands['skill-doctor'](args)
+
+      case 'reload-skills':
+        return await diagCommands['reload-skills'](args)
+
+      case 'insights':
+        return await diagCommands.insights(args)
+
+      case 'import':
+        return await diagCommands.import(args)
 
 
       default: return `未知命令: /${name}（输入 /help 查看可用命令）`
@@ -4349,6 +5174,9 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
   }
 
   // 延迟注册 CommandExecTool（需要引用 handleCommand）
+  // ⚠️ 这里在 2114 行的 applyDeferredTools 之后，所以本工具不参与延迟归一。
+  // 它的 shouldDefer 默认 false（tools.mjs:210），行为正确；但若将来把
+  // CommandExec 加进 DEFERRED_TOOLS 白名单，这里必须再跑一次 applyDeferredTools。
   registry.register(new CommandExecTool(handleCommand))
   // 更新 agent 的工具列表（因为 agent 在前面已初始化，后注册的工具需要同步）
   agent.tools = registry.list()
@@ -4399,7 +5227,7 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
    * 所以单独列出来，带参数时走正常流程（会顶掉当前 run）。
    */
   // /agents 无参只是列表；reload / new 会写（重建提示词、建文件），所以归到这里
-  const READONLY_ONLY_WHEN_BARE = new Set(['trash', 'compact-trash', 'mem', 'tasks', 'agents'])
+  const READONLY_ONLY_WHEN_BARE = new Set(['trash', 'compact-trash', 'mem', 'tasklist', 'agents'])
 
   /**
    * 这些命令**无参时会开弹层**（overlay 抢 rl.onEnter），agent 运行中必须排队；
@@ -4637,6 +5465,18 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
           test: '验证 token 与仓库连通性',
           logout: '清除配置里的 token',
           status: '查看当前配置（默认）',
+        },
+      },
+      // /connectors —— 连接器总览。候选直接从注册表取，
+      // 以后加连接器只要改 core/integrations/connectors.mjs，这里自动跟上
+      // （写死数组的话，新连接器在面板里永远补全不出来）。
+      connectors: {
+        candidates: () => {
+          try { return [...listConnectors().map(c => c.id), 'list', 'help'] } catch { return ['list', 'help'] }
+        },
+        desc: {
+          list: '看全部连接器状态（默认）',
+          help: '说明「连接器」是什么、怎么配',
         },
       },
       // 用户资料（/me）：子命令补全。字段名也列出来，省得记
@@ -5111,8 +5951,9 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
     // 思考深度标注：enabled 且 effort 有效时在模型名后加 (Effort)，如 glm-5.2(Xhigh)
     // thinking 是 Provider 独立配置，优先读当前 Provider；不能只读全局 config.thinking
     const activeThinking = config.providers?.[config.current]?.thinking || config.thinking || {}
-    const effortRaw = activeThinking.enabled ? (activeThinking.effort || '') : ''
-    const effortTag = effortRaw && ['none','minimal','low','medium','high','xhigh','max'].includes(effortRaw)
+    // effort 未设置 = auto 档（/effort auto），标成 Auto 让状态行与实际请求一致
+    const effortRaw = activeThinking.enabled ? (activeThinking.effort || 'auto') : ''
+    const effortTag = effortRaw && ['none','minimal','low','medium','high','xhigh','max','auto'].includes(effortRaw)
       ? `(${effortRaw.charAt(0).toUpperCase()}${effortRaw.slice(1)})`
       : ''
 
@@ -5281,6 +6122,17 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
   fsSession.startClawdIdle()
   // 退出时务必恢复主屏，否则终端停在 alternate screen 里一片空白
   process.on('exit', () => { try { fsSession.stop() } catch {} })
+  // 【2026-10-20 修】退出时释放 wake-lock。
+  //
+  // 原来 `releaseMainWakeLock()`（定义在 260 行）**零调用** —— 只有 acquire，
+  // 没有 release。Termux 的 wake-lock 是持久的（termux-wake-lock 会一直挂着），
+  // 程序退出后锁仍在，系统不让 CPU 休眠，持续耗电。用户不会想到是 CLI 造成的，
+  // 只会觉得"这手机待机怎么这么费电"。
+  //
+  // 【为什么放在 exit】'exit' 是唯一在正常退出（/exit、Ctrl+C 空行、EOF）和
+  // process.exit() 时都会跑的事件。SIGKILL 拦不住，但那种情况本来也无法清理。
+  // 用 execFileSync：'exit' 回调里不能 await，异步 spawn 会来不及执行就退进程了。
+  process.on('exit', () => { try { releaseMainWakeLock() } catch {} })
 
   // 自动备份：重启时静默执行（如果已启用）
 
@@ -5313,8 +6165,16 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
   // 【2026-10-06 加 options】对齐 APK 端：有选项时列出来，用户输编号即可，
   // 也能自由输入（选项外补充说明）。渲染复用 slash 向导的样式（❯ / 编号 / ·）。
   let askResolve = null
-  async function askUser(question, options = []) {
-    const opts = Array.isArray(options) ? options.filter(Boolean).slice(0, 4) : []
+  async function askUser(question, options = [], title, extra = {}) {
+    // 选项现在可能是 {label, description} 对象（对齐官方 AskUserQuestion），
+    // 也可能还是纯字符串（老调用/其他端）。统一成对象再渲染。
+    const rawOpts = Array.isArray(options) ? options.filter(Boolean).slice(0, 4) : []
+    const opts = rawOpts.map((o) => {
+      if (o && typeof o === 'object') {
+        return { label: String(o.label ?? ''), description: String(o.description ?? '') }
+      }
+      return { label: String(o), description: '' }
+    }).filter(o => o.label)
     return new Promise(resolve => {
       askResolve = resolve
       // 暂停主 onEnter
@@ -5325,23 +6185,31 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
         rl.setPrompt(promptStr)
         let ans = (line || '').trim()
         // 纯数字 → 映射成选项（与向导的「输入编号选」同规则）
+        // 多选时接受 "1,3" / "1 3" 这种写法，回填成 "label1, label3"
         if (opts.length && /^\d+$/.test(ans)) {
           const pick = opts[parseInt(ans, 10) - 1]
-          if (pick !== undefined) ans = pick
+          if (pick !== undefined) ans = pick.label
+        } else if (opts.length && extra?.multiSelect && /^[\d,\s]+$/.test(ans) && ans) {
+          const picked = ans.split(/[,\s]+/).map(s => opts[parseInt(s, 10) - 1]).filter(Boolean)
+          if (picked.length) ans = picked.map(o => o.label).join(', ')
         }
         askResolve = null
         resolve(ans || '(no answer)')
       }
       // printAbove 打印问题（+ 选项列表），然后显示一个提示符
+      const dim = C?.dim || '\x1b[2m'
+      const reset = C?.reset || '\x1b[0m'
+      // 有 title 时先打一行标题（官方语义：长问题给个主题，便于扫读）
+      if (title) rl.printAbove(`${dim}${title}${reset}`)
       rl.printAbove(`${C.claude}${question}${C.reset}`)
       if (opts.length) {
-        const dim = C?.dim || '\x1b[2m'
-        const reset = C?.reset || '\x1b[0m'
         const green = C?.green || '\x1b[32m'
         opts.forEach((op, i) => {
-          rl.printAbove(`${dim}  ${green}${i + 1})${reset} ${op}`)
+          // label 一行；description 缩进挂在下面（手机窄屏，不能挤同一行）
+          rl.printAbove(`${dim}  ${green}${i + 1})${reset} ${op.label}`)
+          if (op.description) rl.printAbove(`${dim}       ${op.description}${reset}`)
         })
-        rl.printAbove(`${dim}  （输编号选，或直接打字回答）${reset}`)
+        rl.printAbove(`${dim}  （输编号选，或直接打字回答${extra?.multiSelect ? '；可多选，如 1,3' : ''}）${reset}`)
       }
       rl.setPrompt('> ')
       rl.reset()
@@ -5515,7 +6383,8 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
     // ⚠️ /summary 不在此列：它 await runSideQuestion 发额外 API 请求，
     // 与主请求并发会抢 key、可能撞限流。让它排队。
     'files',      // 上下文文件列表
-    'tasks', 'team', 'agents',  // 持久化任务/团队，独立存储
+    // /tasks 只有「看」能插队，stop 会中止任务 → 放到 SUBCMD 里精确控制
+    'team', 'agents',
     // 【补登记 2026-09-05】用户报「agent 跑时打 /load 竟然排队」。
     // 这批全是纯查看或只写自己那份数据，不碰 agent.messages / api 实例，
     // 之前只是漏登记 —— 判定标准是「会不会破坏正在跑的那一轮」，它们都不会。
@@ -5528,7 +6397,6 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
     'workflow',   // 纯文字说明，没有副作用
     'x11',        // 只开关 X11 标志/进程
     'web',        // 启停独立 web 进程，跟当前轮无关
-    'add-dir',    // 追加工作目录，下一轮的工具才读
     'check',      // 重启预检（只跑语法检查，不重启）
   ])
   const READONLY_BARE = new Set([
@@ -5568,6 +6436,9 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
     mem: new Set(['list', 'ls', 'find', 'search', 'show', 'cat', 'dir']),
     // /goal 的查看类：status/list 只读；set/replace/clear 会影响推进循环
     goal: new Set(['status', 'list', 'help']),
+    // /tasks —— 裸 /tasks 与 list/all 是纯查看，可插队；
+    // stop 会中止后台任务，必须排队（不在白名单里 = 带参一律排队）。
+    tasks: new Set(['list', 'all', 'show']),
     // /memory 查看类；append/init 写 CLAUDE.md（下一轮才重建提示词，安全）
     memory: new Set(['show', 'list', 'append', 'init']),
     // /help <主题> 返回纯文本，可以插队；**裸 /help 会开 overlay 弹层**抢输入焦点，
@@ -6018,6 +6889,12 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
           rl.addHistory(input)
           // 防御：展开结果若以 / 开头会被再当成命令，导致无限递归；加前缀打断
           let body = expanded.content.trim()
+          // MCP prompt（mcp_<server>_<prompt>）：自定义命令表先命中占位，
+          // 这里再调 prompts/get 拿真实正文替换。
+          if (expanded.__mcpPrompt && mcpClient?.expandMcpPrompt) {
+            const real = (await mcpClient.expandMcpPrompt(expanded, args.join(' '))).trim()
+            if (real) body = real
+          }
           if (body.startsWith('/')) body = '请执行以下指令：\n' + body
           // 【2026-10-05 修】直接 return 会跳过函数末尾的清理，导致活动看板
           // 永久显示「◆ /xxx 秒数一直涨」。这三处 return 分支都要自己清。
@@ -6045,6 +6922,10 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
             // （见 core/skills.mjs 里的注释），包含参数替换 + 资源清单 + hooks 注册。
             // 不要在这里写第二套展开实现，否则两条入口行为会漂移。
             const ex = expandActiveSkill(skillLoader, name, args.join(' '), hookManager)
+            // 登记到 activeSkills（与 SkillTool 的 onExpand 同源）。
+            // 两条入口都要记：模型调工具、用户敲 /名字。只记一条的话
+            // /skill-doctor 会漏掉另一半，统计出来是假数。
+            try { activeSkills.add(name) } catch {}
             let sbody = String(ex?.content || '').trim()
             if (!sbody) return `skill "${name}" 内容为空`
             if (sbody.startsWith('/')) sbody = '请执行以下指令：\n' + sbody
@@ -6334,6 +7215,10 @@ vision on 时图片原图直入（模型直接看图）；off 时走视觉模型
       // goal 模式：一次 agent.run = 一个 goal turn，由 runGoalLoop 在 run 之外决定
       // 要不要再来一轮（终止判定、预算结算都在它那里）。agent 完全不知道 goal 存在。
       // 复用同一条 runPromise 通道，让 spinner/流式渲染/收尾/保存全部沿用现成逻辑。
+      //
+      // 心跳：每轮开始时刷新注册表的 lastSeen。没有它的话，一个跑了 15 分钟的
+      // 长任务会被 isAlive 判成过期（STALE_MS = 10 分钟），别的会话就发不过来了。
+      try { peerHeartbeat() } catch {}
       const runPromise = opts.goalDrive
         ? runGoalLoop({
             agent,

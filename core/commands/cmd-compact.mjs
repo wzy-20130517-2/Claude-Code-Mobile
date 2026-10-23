@@ -55,6 +55,33 @@ function reestimateAfterCompact(ctx, messages) {
   } catch { /* 估算失败不影响压缩本身 */ }
 }
 
+/**
+ * 触发压缩前后的 hook（手动路径专用）。
+ *
+ * 【为什么手动路径要单独补（2026-10-20）】PreCompact/PostCompact 原来只在
+ * `index.mjs` 的自动压缩回调里触发，手动 `/compact` 全程没有任何 hook 调用 ——
+ * 用户配的「压缩前先备份到别处」「压缩后通知我」这类脚本，只有等到自动压缩
+ * 才会跑，而自动压缩默认是关的，等于永远不跑。
+ *
+ * 【trigger 字段】官方 schema 里 PreCompact/PostCompact 带 `trigger: ["manual","auto"]`，
+ * hook 脚本据此区分两种来源。这里传 'manual'，自动路径那边不传（默认按 auto 处理）。
+ *
+ * 全部吞异常：hook 是附加能力，它挂了不能把压缩本身弄失败。
+ */
+async function fireCompactHook(ctx, event, extra = {}) {
+  const hm = ctx?.hookManager
+  if (!hm || typeof hm.trigger !== 'function') return
+  try {
+    await hm.trigger(event, {
+      event,
+      trigger: 'manual',
+      tokenCount: ctx.agent?.getLastPromptTokens?.() || 0,
+      tokenLimit: ctx.getMaxContext?.(),
+      ...extra,
+    })
+  } catch { /* hook 失败不影响压缩 */ }
+}
+
 export function makeCompactCommand(ctx) {
   return {
     async compact(args) {
@@ -132,6 +159,8 @@ export function makeCompactCommand(ctx) {
         }
 
         const historyBefore = ctx.agent.getHistory()
+        // 手动压缩前触发 PreCompact（与自动路径同语义，trigger 标记为 manual）
+        await fireCompactHook(ctx, 'PreCompact', { messages: historyBefore.length })
         const _abort2 = ctx.newCompactAbort()
         let result
         try {
@@ -146,6 +175,12 @@ export function makeCompactCommand(ctx) {
           const backupName = ctx.backupBeforeCompact(historyBefore, { sessionId: ctx.sessionId(), reason: 'manual', meta: { keepLast, strategy: result.strategy } })
           ctx.agent.setHistory(result.messages)
           reestimateAfterCompact(ctx, result.messages)   // ★ 压缩后重估
+          // 压缩完成后再触发 PostCompact，带上结果供 hook 脚本记录/通知
+          await fireCompactHook(ctx, 'PostCompact', {
+            messages: result.messages.length,
+            strategy: result.strategy,
+            keepLast,
+          })
           return `压缩完成：${result.messages.filter(m => m.role !== 'system').length} 条消息，保留最后 ${keepLast} 条 (${result.strategy})\n`
             + `(完整会话已备份到压缩回收站: ${backupName})`
             + formatSummary(result.summary)
@@ -161,9 +196,11 @@ export function makeCompactCommand(ctx) {
  * 只在压缩回收站里留备份不够：用户不会主动去翻，等他发现不对时早就基于
  * 错误摘要跑了好几轮。当场显示，让他一眼能判断"压得对不对"。
  *
- * 【为什么截断 + 完整版单独落盘】摘要可达 16000 字符（SUMMARY_CHAR_LIMIT），
+ * 【为什么屏幕上只显示 1200 字符 + 完整版单独落盘】
+ * 摘要本身**不做字符截断**（2026-10-21 取消了 16000 上限），一次可能两万多字符。
  * 全量打印会把整个屏幕刷掉，反而看不清。所以屏幕上前 1200 字符，
  * **完整摘要写进独立文件**（~/.claude-code-mobile/last-summary.md），提示指向它。
+ * 注意这是「显示截断」，不是「数据截断」——存进历史的摘要始终是完整的。
  *
  * ⚠ 不要往「压缩回收站」里塞摘要：那是会话备份，restore 的语义是
  *   「还原压缩前的完整上下文」，混进摘要会让备份不再是干净的消息快照

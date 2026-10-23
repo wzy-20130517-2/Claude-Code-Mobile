@@ -21,6 +21,86 @@ export function buildTool(def) {
   return { ...TOOL_DEFAULTS, ...def }
 }
 
+/**
+ * 延迟加载清单：这些工具的 schema 每轮全量发是浪费，标 shouldDefer 后只输出占位，
+ * 模型要用时经 ToolSearch 取回完整 schema。
+ *
+ * 【收录标准 —— 三条同时满足】
+ *   1. 低频：正常会话里几十轮才可能用一次，模型不查说明也不会调；
+ *   2. 有辨识度：光看名字 + searchHint 就能判断「是不是我要的」，不需要读参数；
+ *   3. schema 够大：占位本身约 150 字符，schema 小于 200 的省不出什么还多一次调用。
+ *
+ * 【为什么不放在各自工具文件里标 shouldDefer】那些文件不在本次改动范围，
+ * 且集中一处更便于审「到底谁被延迟了」。MCP 工具、DSH 插件工具等运行时注册的
+ * 一律不延迟 —— 它们本来就不是每轮都在，且 schema 来源不受我们控制。
+ *
+ * 【故意不延迟的核心工具】Bash/Read/Write/Edit/Grep/Glob/CodeSearch/Diagnostics/
+ * TodoWrite/Agent/AgentStatus/AgentOutput/AgentStop/Task 系列/Team 系列/SendMessage/
+ * CheckMessages/Memory/Skill/CommandExec/ViewImage/Screencap/WebSearch/SearchInfo/
+ * Lookup/WebFetch/FindImage/GitStatus/GitDiff/GitLog/EnterPlanMode/ExitPlanMode ——
+ * 这些每轮都可能用，延迟反而凭空多一次工具调用。
+ */
+export const DEFERRED_TOOLS = new Set([
+  // GitHub 工具集：整个按需，没配 /github repo 时根本用不上
+  'GitHubRepo', 'GitHubIssues', 'GitHubIssueView', 'GitHubPRs', 'GitHubPRComments',
+  'GitHubComment', 'GitHubCreateIssue', 'GitHubFile',
+  // 生图 / 视频：明确的任务型工具，来活才用
+  'ImageGen', 'ViewVideo',
+  // Hashline 系列：精确锚点编辑，Read/Edit 覆盖绝大多数场景
+  'HashlineRead', 'HashlineEdit', 'HashlineGrep',
+  // 手机操作低频项：phone_snapshot / phone_click / phone_type / phone_app 是主力，不延迟；
+  // 这四个要么是诊断通道，要么是兜底路径，正常流程走不到
+  'phone_shell', 'phone_screenshot', 'phone_tap_xy', 'phone_wait', 'phone_vd',
+  // DSH 插件宿主管理：普通会话完全不碰
+  'DshPlugin',
+  // 目标契约：/goal 场景专用，日常对话用不到
+  'GetGoal', 'GoalStatus', 'ProposeGoal', 'SetGoalBudget',
+  // 定时 / 唤醒：低频。CronList/CronDelete 同时在 EXCLUDED（schema 比占位还短），
+  // 实际不会被标记，留在这里只是记录「评估过」—— 真正生效的是下面那个集合。
+  'CronCreate', 'CronDelete', 'CronList', 'Sleep',
+  // worktree：只有用户明确说 worktree 才用
+  'EnterWorktree', 'ExitWorktree',
+  // 多 Agent 辅助：Agent 系列主力不延迟，这些是查询/记忆类
+  'AgentMemory', 'ListAgents', 'ReleaseHeldMessages', 'SendMessagePeer',
+  // 仓库结构分析：大仓库才用，且 RepoMap/Symbols 常配 Bash 兜底
+  'RepoMap', 'Symbols', 'SafeRename',
+  // 补丁 / 测试 / 笔记本：NotebookEdit 只在 .ipynb 出现时才有意义
+  'NotebookEdit', 'ApplyPatch', 'Test',
+  // 装饰性 / 一次性：Toast/Notify/Vibrate/TTS/Share/OpenUrl 都是「告诉用户一件事」
+  'Toast', 'Notify', 'Vibrate', 'TTS', 'Share', 'OpenUrl',
+  // 模式切换开关：模型自己切 deep/watch/plan 的场景很少，且命令里也能切
+  'EnterDeepMode', 'ExitDeepMode', 'EnterWatch', 'ExitWatch',
+])
+
+/**
+ * 延迟白名单里的例外 —— 已实测「占位比完整 schema 还长」或收益为负，不延迟。
+ * 留档是为了下次有人想把它们加回来时，不用重新测算一遍。
+ * 测算脚本：/sdcard/Download/claude-workspace/audit/calc-defer.mjs
+ */
+export const DEFERRED_EXCLUDED = new Set([
+  'Battery', 'ClipboardSet', 'TeamStatus', 'CronList', 'CronDelete',
+])
+
+/**
+ * 把清单应用到 registry：命中即标 shouldDefer，未命中的一律清零。返回实际标记的数量。
+ *
+ * 【为什么要把未命中的 shouldDefer 清掉】tools-teams.mjs / tools-goal.mjs 里有两个工具
+ * 自带 `shouldDefer: true`（官方 claude.js 的原始写法）。其中 SendMessage 是多 Agent
+ * 的核心通道，延迟它等于「给队友发消息前要先检索一次」，纯属倒贴；而这两个文件不在
+ * 本次改动范围。所以在这里做归一：**只有白名单说话算**，别处自带的标记一律失效。
+ * 单一真相源比「白名单 + 散落的 true」好审。
+ */
+export function applyDeferredTools(registry) {
+  let n = 0
+  for (const t of registry.list()) {
+    if (!t || typeof t.shouldDefer !== 'boolean') continue
+    const want = DEFERRED_TOOLS.has(t.name) && !DEFERRED_EXCLUDED.has(t.name)
+    t.shouldDefer = want
+    if (want) n++
+  }
+  return n
+}
+
 // 输出检查器：超过限制时把完整结果写磁盘，返回摘要
 const TOOL_OUTPUT_DIR = join(homedir(), '.claude-code-mobile', 'tool-output')
 
@@ -112,6 +192,41 @@ export class Tool {
     this.maxResultSizeChars = opts.maxResultSizeChars ?? null
     this._validateInput = opts.validateInput
     this._checkPermissions = opts.checkPermissions
+    // ── 官方工具元数据（2026-10-20 补齐）──────────────────────────────
+    //
+    // 【为什么必须在这里显式透传】buildTool 是 `{...默认值, ...def}`，
+    // 子类写在 config 里的未声明 key 确实会进 opts —— 但构造器只赋上面那几个字段，
+    // 其余的**当场丢失**。表现是：子类认真写了 `searchHint` / `aliases`，
+    // 运行时读到的永远是 undefined，而且不报错，查起来极其费劲。
+    //
+    // 所以新增元数据一律要在这里落成实例字段，别指望「反正 spread 进来了」。
+
+    /** 别名：模型可以用这些名字调本工具（官方 Agent 的 aliases 是 ["Task"]） */
+    this.aliases = Array.isArray(opts.aliases) ? opts.aliases.slice() : []
+    /** 工具检索用的一句话说明（CCM 暂无检索管线，先存着） */
+    this.searchHint = opts.searchHint ?? null
+    /** 后台运行策略：'never' | 'detach'（CCM 未实现自动后台化，先存） */
+    this.backgrounding = opts.backgrounding ?? null
+    /** 延迟加载标记（CCM 无 ToolSearch，仅存） */
+    this.shouldDefer = opts.shouldDefer ?? false
+    /**
+     * 已被 ToolSearch 解除延迟 —— 运行时状态，不是构造参数。
+     * undefined/false = 仍按占位输出；true = 输出完整 schema。
+     * 见 toSchema() 的 shouldDefer 分支。
+     */
+    this._deferOverride = false
+    /** UI 展示名（无则退回 name） */
+    this.userFacingName = opts.userFacingName ?? null
+    /** 结构化输出 schema。**只存不校验** —— CCM 没有结构化输出管线，
+     *  硬校验会让现有全部工具（返回纯文本）当场失败。 */
+    this.outputSchema = opts.outputSchema ?? null
+    /** 权限分类器输入（CCM 的 checkPermissions 目前整包传 input，先存） */
+    this.toAutoClassifierInput = typeof opts.toAutoClassifierInput === 'function'
+      ? opts.toAutoClassifierInput
+      : null
+    /** 入参归一化：旧字段名 → 新字段名（见 run()） */
+    this.coerceInput = typeof opts.coerceInput === 'function' ? opts.coerceInput : null
+
     this.mcpServer = null
     this.mcpTool = null
     // 保留额外参数（如 undoStore）
@@ -128,7 +243,12 @@ export class Tool {
 
   // 构造时元数据
   isReadOnly() { return this._isReadOnly() }
-  isDestructive() { return this._isDestructive() }
+  // isDestructive 可以按输入判断（官方 ExitWorktree 就是 `(v) => v.action === 'remove'`）。
+  // 传入 input 才有意义：不传时按「无参数」求值，参数化实现会得到 undefined，
+  // 对 ExitWorktree 这种「看 action 决定」的工具会误判成「不破坏」。
+  // 调用方（权限层）应该把 input 传进来；无参调用兜底成布尔 false，
+  // 避免 `if (tool.isDestructive())` 拿到 undefined 这种半真半假的值。
+  isDestructive(input) { return !!this._isDestructive(input) }
   isConcurrencySafe() { return this._isConcurrencySafe() }
 
   // 参数校验：统一返回 { valid, errors }
@@ -175,15 +295,42 @@ export class Tool {
   // 包装执行：校验 → 权限 → 执行 → 截断
   // ctx 透传给 execute，里面带 signal（由 Agent 在超时/中断时 abort）
   async run(input, ctx = {}) {
+    // ── 入参归一化（旧字段名 → 新字段名）──────────────────────────
+    //
+    // 【为什么放在 validateInput 之前】coerceInput 的用途就是把「模型按旧 schema
+    // 传的字段」翻译成新字段。放校验之后就晚了 —— 校验会因为「必填字段缺失」先拒掉，
+    // 模型拿到的错误是「缺 text」，而它明明传了 content，只会越改越乱。
+    //
+    // 【为什么必须是新对象】调用方的 input 可能还被别处引用（trace 记录、
+    // 权限规则匹配、UI 渲染工具卡片）。原地改会污染那些读取方，
+    // 且一旦 coerceInput 抛错，input 已经被改了一半 —— 状态不可回滚。
+    //
+    // coerceInput 返回值约定：
+    //   · 返回对象 → 用它（视为已归一化）
+    //   · 返回 null/undefined → 认为无需改动，沿用原 input
+    // 两种都接受，避免子类为「无需改动」分支额外写 return input。
+    let effectiveInput = input
+    if (this.coerceInput) {
+      let coerced
+      try {
+        coerced = this.coerceInput(input)
+      } catch (e) {
+        // 归一化失败不该让整个工具调用挂掉 —— 退化成用原始 input 继续，
+        // 让后面的 validateInput 给出正常的字段错误提示。
+        coerced = null
+      }
+      if (coerced && typeof coerced === 'object') effectiveInput = coerced
+    }
+
     // 参数校验：失败时给出清晰提示（已收到参数 vs schema 要求），引导模型修正重试而非放弃
     // 再归一化一次：子类可能整体覆写 validateInput（绕过基类的归一化），
     // 这里兜底保证 v 一定是 { valid, errors } 形状，永不出现 null.valid 崩溃。
-    const v = this._normalizeValidation(this.validateInput(input))
+    const v = this._normalizeValidation(this.validateInput(effectiveInput))
     if (!v.valid) {
       const errors = (v.errors || []).join('; ')
       // 统计已收到的参数名
-      const received = input && typeof input === 'object'
-        ? Object.keys(input).filter(k => input[k] !== undefined && input[k] !== null && input[k] !== '')
+      const received = effectiveInput && typeof effectiveInput === 'object'
+        ? Object.keys(effectiveInput).filter(k => effectiveInput[k] !== undefined && effectiveInput[k] !== null && effectiveInput[k] !== '')
         : []
       const receivedStr = received.length ? received.join(', ') : '(无)'
       // 统计 schema 要求的必填参数
@@ -199,22 +346,74 @@ export class Tool {
       )
     }
     // 权限检查
-    const perm = await this.checkPermissions(input)
+    const perm = await this.checkPermissions(effectiveInput)
     if (perm.behavior === 'deny') {
       throw new Error(`权限被拒绝: ${perm.message || '操作未获授权'}`)
     }
     // 执行
-    const result = await this.execute(perm.updatedInput || input, ctx)
+    const result = await this.execute(perm.updatedInput || effectiveInput, ctx)
     // 结果截断
-    return truncateResult(result, this.maxResultSizeChars ?? getMaxOutputLength(), this.name)
+    //
+    // 上限可以是「按输入动态算」的：工具可实现 getMaxResultSizeChars(input)，
+    // 由它决定这一次的上限（例如 Read 的 allow_large 会抬高上限）。没实现就
+    // 沿用构造时写死的 maxResultSizeChars。传 input 是为了让「用户明确要求
+    // 读全部」这类意图能突破默认截断，而不是被迫反复分页。
+    const limit = typeof this.getMaxResultSizeChars === 'function'
+      ? (this.getMaxResultSizeChars(perm.updatedInput || effectiveInput) ?? this.maxResultSizeChars ?? getMaxOutputLength())
+      : (this.maxResultSizeChars ?? getMaxOutputLength())
+    return truncateResult(result, limit, this.name)
   }
 
+  /**
+   * 转成 API 工具 schema。
+   *
+   * 【shouldDefer 的消费点】`shouldDefer: true` 的工具只输出**占位 schema**：
+   * name + 一句话 description（含 ToolSearch 提示）+ 空 parameters。
+   * 完整参数说明由 ToolSearch 取回后再切回 `this._deferOverride === true` 的完整态。
+   *
+   * 【为什么在 toSchema 里判状态，而不是只由 registry 过滤】
+   * agent.mjs 两处都是 `this.tools.map(t => t.toSchema())`，而 this.tools 持有的是
+   * **同一批 Tool 实例引用**。所以标志位翻转在实例上即可影响下一轮请求，
+   * 不需要 agent.mjs 参与 —— 这也是「延迟加载不改 agent」的原因。
+   *
+   * 【__deferred 是给谁看的】本地标记。api.mjs 三种协议都只取
+   * name/description/input_schema，未知字段不会外发（已核实 openai 1297、
+   * anthropic 1831、responses 1478 三处 map）。
+   */
   toSchema() {
+    if (this.shouldDefer && this._deferOverride !== true) return this._deferredSchema()
     return {
       name: this.name,
       description: this.description,
       input_schema: this.input_schema
     }
+  }
+
+  /** 占位 schema：只留名字和一句话，让模型知道「有这个工具，细节要检索」 */
+  _deferredSchema() {
+    return {
+      name: this.name,
+      description: this._deferredDescription(),
+      input_schema: { type: 'object', properties: {} },
+      __deferred: true,
+    }
+  }
+
+  /**
+   * 占位 description。优先用 searchHint（本来就是一句话检索说明），
+   * 没有则从完整 description 里截第一段 —— 完整 description 往往上千字符，
+   * 全放进去等于没省。
+   */
+  _deferredDescription() {
+    const raw = String(this.searchHint || '').trim() || String(this.description || '').split('\n')[0].trim()
+    const brief = raw.length > 110 ? raw.slice(0, 107) + '...' : raw
+    return `（延迟加载）${brief || '工具'}。用 ToolSearch(query/select) 取完整参数说明`
+  }
+
+  /** 解除延迟：下一轮 toSchema() 输出完整 schema。幂等。 */
+  undefer() {
+    this._deferOverride = true
+    return this
   }
 }
 
@@ -225,6 +424,9 @@ export class ToolRegistry {
     // 用独立 Map 而不是遍历 this.tools：get() 在每轮工具调用都要走，
     // 遍历 100+ 个工具只为找一个名字是纯浪费。
     this._lower = new Map()
+    // 别名（小写）→ 正式名。官方 Agent 的 aliases 是 ["Task"]，
+    // 模型按 Task 调会落到这里，而不是 Tool not found。
+    this._aliases = new Map()
   }
 
   /** 内部：登记小写索引（重名时后者覆盖，与 Map.set 行为一致） */
@@ -232,10 +434,33 @@ export class ToolRegistry {
     this._lower.set(String(name).toLowerCase(), name)
   }
 
+  /**
+   * 登记一个工具的别名。
+   *
+   * 【只做单向映射，不写进 this.tools】别名不是独立工具：
+   * 写进 tools 会让 list()/toSchemas() 重复输出同一个工具的两份 schema，
+   * 模型会看到 `Read` 和它的别名各一条 —— 既浪费 prompt，也会让它以为
+   * 两者行为不同。别名只影响「按名取」。
+   *
+   * 【不覆盖真名】如果别名恰好和某个已注册工具同名，真名优先，
+   * 别名忽略（否则 register 顺序会决定谁能被调到，极难排查）。
+   */
+  _indexAliases(t) {
+    if (!t || !Array.isArray(t.aliases) || t.aliases.length === 0) return
+    for (const a of t.aliases) {
+      if (!a || typeof a !== 'string') continue
+      const low = a.toLowerCase()
+      // 与真名冲突时让位（含大小写不敏感冲突）
+      if (this.tools.has(a) || this._lower.has(low)) continue
+      this._aliases.set(low, t.name)
+    }
+  }
+
   register(t) {
     if (!(t instanceof Tool)) throw new Error('Must be Tool')
     this.tools.set(t.name, t)
     this._indexLower(t.name)
+    this._indexAliases(t)
   }
   // 惰性注册：传工厂函数 (registry) => Tool，首次 get 时才实例化
   // 参考 OpenCode define+init：工具可声明依赖（如 undoStore/agent 服务），按需注入
@@ -245,7 +470,7 @@ export class ToolRegistry {
   }
 
   /**
-   * 按名取工具。**大小写不敏感**。
+   * 按名取工具。**大小写不敏感**，并支持别名。
    *
    * 【为什么】模型经常把工具名写错大小写（`Read` 写成 `read`、`GitStatus`
    * 写成 `gitstatus`、`WebSearch` 写成 `websearch`）。Claude 官方 API 的
@@ -254,9 +479,10 @@ export class ToolRegistry {
    * `Tool "read" not found`，整轮白跑。
    *
    * 【为什么不用遍历】get() 在每次工具调用都走，100+ 工具时遍历是浪费；
-   * 用 _lower 索引 O(1)。
+   * 用 _lower / _aliases 索引 O(1)。
    *
    * 精确匹配优先（避免「注册了 Read 和 read 两个工具」时的歧义）。
+   * 查找顺序：真名精确 → 真名大小写不敏感 → 别名大小写不敏感。
    */
   get(n) {
     let key = n
@@ -269,18 +495,70 @@ export class ToolRegistry {
         t = this.tools.get(key)
       }
     }
+    if (t === undefined && typeof n === 'string') {
+      // 别名回退（官方 Agent 的 aliases: ["Task"] 走这条）
+      const aliased = this._aliases.get(n.toLowerCase())
+      if (aliased !== undefined) {
+        key = aliased
+        t = this.tools.get(key)
+      }
+    }
     if (t && t.__lazy) {
       const real = t.factory(this)
       if (!(real instanceof Tool)) throw new Error(`Lazy tool ${key} factory must return Tool`)
       real.__name = key
       this.tools.set(key, real)
+      // 惰性工具的真身可能是带别名的那一个 —— 实例化后再补登记一次
+      this._indexAliases(real)
       return real
     }
     return t
   }
   list() { return Array.from(this.tools.values()).map(t => (t && t.__lazy) ? this.get(t.name) : t) }
   toSchemas() { return this.list().map(t => t.toSchema()) }
-  
+
+  // ── ToolSearch 延迟加载 ────────────────────────────────────────────────
+  //
+  // 三件套给 ToolSearch 工具用：检索（谁命中）、解除（切完整态）。
+  // 都只动 `shouldDefer` 工具的运行时状态，不改注册表结构 —— 所以 MCP 工具
+  // 晚到同步（index.mjs 重新赋 agent.tools）时不需要额外处理。
+
+  /** 当前仍处于延迟态的工具（占位输出的那一批） */
+  listDeferred() { return this.list().filter(t => t && t.shouldDefer && t._deferOverride !== true) }
+
+  /**
+   * 按关键词检索延迟工具。
+   *
+   * 命中优先级（降序）：name 命中 > searchHint 命中 > description 命中。
+   * 只返回最高优先级那一档 —— 否则 `query:"phone"` 会连带命中 description 里
+   * 提到 phone_wait 的 Sleep 之类，一次检索加载一堆无关工具，反而更浪费。
+   *
+   * 返回工具实例（不是 schema）—— 调用方决定是只报告还是顺便解除延迟。
+   */
+  searchDeferred(query) {
+    const q = String(query || '').trim().toLowerCase()
+    if (!q) return []
+    const pool = this.listDeferred()
+    const byName = pool.filter(t => String(t.name || '').toLowerCase().includes(q))
+    if (byName.length > 0) return byName
+    const byHint = pool.filter(t => String(t.searchHint || '').toLowerCase().includes(q))
+    if (byHint.length > 0) return byHint
+    return pool.filter(t => String(t.description || '').toLowerCase().includes(q))
+  }
+
+  /**
+   * 解除延迟。返回 { ok, name }。
+   * already=true 表示该工具本来就没延迟（模型重复 select 时会出现）——
+   * 对调用方是有用信息，不算错误。
+   */
+  undefer(name) {
+    const t = this.get(name)
+    if (!t) return { ok: false, name: String(name), error: `工具不存在: ${name}` }
+    if (!t.shouldDefer) return { ok: false, name: t.name, already: true }
+    t.undefer()
+    return { ok: true, name: t.name }
+  }
+
   // 列出只读工具（可用于并行优化）
   listReadOnly() { return this.list().filter(t => t.isReadOnly()) }
   // 列出可并行工具

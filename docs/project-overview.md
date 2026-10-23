@@ -292,7 +292,7 @@ noninteractive.mjs           9
 | `/keepalive` | 息屏保活（wake-lock + 静音音频） |
 | `/backup` | 备份（隐藏命令） |
 | `/editor` | 外部编辑器写长 prompt |
-| `/add-dir` `/workspace` | 工作区目录管理 |
+| `/workspace` | 工作区目录查看/设置 |
 
 ### 扩展机制
 

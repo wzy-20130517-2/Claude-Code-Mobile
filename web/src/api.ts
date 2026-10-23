@@ -357,15 +357,43 @@ export async function createProjectConversation(projectId: string, title?: strin
 export async function getUserArtifacts(): Promise<any[]> { return [] }
 export async function getArtifactContent(...args: any[]): Promise<any> { return { content: '' } }
 /**
- * 连接器状态（GitHub / QQ）。
+ * 连接器状态（GitHub / QQ / MCP / 邮箱）。
  *
  * 【2026-09-19】原来 getGithubStatus 是个 stub（永远 connected:false），
  * 所以连接器页面那个「已连接」徽章从来没亮过 —— 配置了 token 也显示未连接。
  * 现在从服务端 /api/connectors/status 读真实状态（那里直接读本地配置文件）。
+ *
+ * 【2026-10-20】服务端改读 core/integrations/connectors.mjs（与 CLI 的 /connectors
+ * 命令同一份探针），响应里多了 connectors 数组和 meta 汇总。
+ * 顶层 github / qq 两个键**保留不动** —— CustomizePage 与 connectorCatalog
+ * 现在就是按这两个键读的，删了会让连接器页面整片空白。
  */
+export interface ConnectorStatusEntry {
+  id: string
+  title: string
+  category: string
+  summary: string
+  configCommand: string
+  statusCommand: string
+  connected: boolean
+  detail: string
+  error?: string
+  /** MCP 专有 */
+  servers?: Array<{ name: string; disabled: boolean; state: string; toolCount: number | null }>
+  /** 邮箱专有（只回别名与域名，不含授权码） */
+  accounts?: Array<{ alias: string; isDefault: boolean; host: string; domain: string }>
+  /** QQ 专有 */
+  owner?: string | null
+  endpoint?: string
+  otherEndpoints?: string[]
+  [key: string]: any
+}
+
 export async function getConnectorStatuses(): Promise<{
   github: { connected: boolean; detail: string; defaultRepo?: string | null; masked?: string };
   qq: { connected: boolean; detail: string; owner?: string | null };
+  connectors?: ConnectorStatusEntry[];
+  meta?: { total: number; connected: number; connectedIds: string[]; disconnectedIds: string[] };
 }> {
   try {
     const res = await fetch(`${API_BASE}/connectors/status`);

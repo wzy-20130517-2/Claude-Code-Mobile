@@ -31,7 +31,7 @@ export function makeHelpCommand(ctx) {
   return {
     async help(args) {
         // 分层帮助：默认只给「每天真的会用」的十几条，细节按主题展开。
-        // 原来一次泼 180 行 / 110 条命令，/ctx.config 分散出现 4 次、/image 重复两遍，
+        // 原来一次泼 180 行 / 110 条命令，/config 分散出现 4 次、/image 重复两遍，
         // 常用命令埋在里面根本找不到 —— 用户反馈「太乱了，没几个人看了会用」。
         const topic = String(args[0] || '').toLowerCase()
         // skill 名单：832 个 skill 也是 slash 命令，但不该出现在
@@ -60,9 +60,9 @@ export function makeHelpCommand(ctx) {
             '直接输入消息即可对话。行末加 \\ 换行，Ctrl+I 补全，Ctrl+X 重启。',
             '',
             '日常最常用',
-            '  /model <名称>     换模型        /ctx.config        切 Provider',
+            '  /model <名称>     换模型        /config          切 Provider',
             '  /context          看上下文占用   /compact       压缩上下文',
-            '  /clear            清空记录（可 /clear-restore 恢复）   /new  开新对话',
+            '  /clear            开新对话（/reset /new 等价）      /clear-history 清空记录',
             '  /resume [id]      恢复会话      /undo          撤销文件改动',
             '  /diff             看 git 改动    /status        一屏状态汇总',
             '  /image [路径|序号] 识图（无参=最新截图，/image list 挑图）',
@@ -154,9 +154,9 @@ export function makeHelpCommand(ctx) {
 直接输入消息即可对话。行末加 \\ 换行，Ctrl+I 补全，Ctrl+X 重启。
 
 日常最常用
-  /model <名称>     换模型        /ctx.config        切 Provider
+  /model <名称>     换模型        /config          切 Provider
   /context          看上下文占用   /compact       压缩上下文
-  /clear            清空记录（可 /clear-restore 恢复）   /new  开新对话
+  /clear            开新对话（/reset /new 等价）      /clear-history 清空记录
   /resume [id]      恢复会话      /undo          撤销文件改动
   /diff             看 git 改动    /status        一屏状态汇总
   /image [路径|序号] 识图（无参=最新截图，/image list 挑图）

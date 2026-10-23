@@ -8,15 +8,17 @@
 //   /branch   从当前会话分叉出新会话
 //   /rewind   单文件改动回滚（multiUndo）
 //   /copy     复制会话全文到剪贴板
-//   /add-dir  把目录加入上下文白名单
 //   /review   代码审查（给出 diff 视角的审查提示）
 //   /plugins  插件列表
 //   /x11      X11 图形环境配置
 //
+// 【2026-10-22 移出 /add-dir】它从来没有生效过（extraDirs 无消费方、
+// CCM 也没有目录白名单），已连同实现一起删除，详见 cmd-extensions.mjs 的说明。
+//
 // 【为什么单独一个文件而不是塞进 cmd-misc】cmd-misc 管的是保活/回收站/字体，
 // 这批管的是会话操作，混在一起下次找命令要翻两个语义域。
 
-import { cmdBranch, cmdRewind, cmdCopy, cmdAddDir, cmdReview, cmdPlugins, cmdX11 } from './cmd-extensions.mjs'
+import { cmdBranch, cmdRewind, cmdCopy, cmdReview, cmdCodeReview, cmdPlugins, cmdX11 } from './cmd-extensions.mjs'
 
 /**
  * @param {object} ctx
@@ -52,28 +54,24 @@ export function makeSessionExtraCommands(ctx) {
     },
 
     /** /copy — 把当前会话全文复制到剪贴板 */
-    copy() {
-      return cmdCopy(ctx.agent)
-    },
-
-    /**
-     * /add-dir <路径> — 加进上下文可读目录白名单。
-     *
-     * ⚠ Incognito 下禁止添加本项目目录：隐私模式的意义是「不进历史文件」，
-     * 而把 claude-code-mobile 整个目录加进上下文等于把它自己（含会话存档、
-     * 回收站、可能还有 key）读进来。CLI 侧原来在 switch 里判，搬过来同样要判。
-     */
-    'add-dir'(args) {
-      if (ctx.incognito?.() && args.some(ctx.isProtectedPath || (() => false))) {
-        return 'Incognito 禁止添加 claude-code-mobile'
-      }
-      return cmdAddDir(args)
+    copy(args) {
+      return cmdCopy(ctx.agent, args)
     },
 
     /** /review — 代码审查（把改动喂给 agent 做 review 视角的分析） */
     review(args) {
       if (ctx.incognito?.()) return 'Incognito 会话禁用 /review'
       return cmdReview(args)
+    },
+
+    /**
+     * /code-review —— 官方 2.1.303 的正式名（/review 是它的别名，见 COMMAND_ALIASES）。
+     * 实现在 cmd-extensions 的 cmdCodeReview：先拦掉官方独有的 ultra 子命令，
+     * 其余走本地静态扫描 cmdReview，与 /review 同一份实现。
+     */
+    'code-review'(args) {
+      if (ctx.incognito?.()) return 'Incognito 会话禁用 /code-review'
+      return cmdCodeReview(args)
     },
 
     /** /plugins — 列出已装插件 */

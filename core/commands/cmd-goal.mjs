@@ -9,6 +9,7 @@
 import {
   createGoal, clearGoal, reviseGoal, setGoalStatus, snapshot, listAllGoals,
   parseDuration, parseCount, DEFAULT_TURN_BUDGET,
+  loadProposal, clearProposal, approveProposal,
 } from '../agent/goal.mjs'
 import { renderGoalCard, buildGoalContract, budgetLine } from '../agent/goal-runtime.mjs'
 
@@ -27,6 +28,11 @@ const HELP = `/goal — 完成契约（目标模式）
   /goal replace <新目标>      放弃当前目标换新的
   /goal clear                 放弃当前目标
   /goal list                  所有会话的目标
+
+  ── 模型提议的目标（ProposeGoal）──
+  /goal proposal              看模型提议的目标（没批准就不生效）
+  /goal approve               采纳模型提议的目标并开始推进
+  /goal reject                拒绝提议
 
 设定时可内联写契约（推荐，一次说清四要素）：
   /goal 把 core/x.mjs 的错误处理补全 --proof "node --check 通过且 tests/x 全绿"
@@ -153,6 +159,48 @@ export function handleGoalCommand(args = [], ctx = {}) {
     const old = clearGoal(sid)
     if (!old) return '当前没有目标，无需放弃。'
     return `已放弃目标：${old.objective}\n${C.dim || ''}（进度不再保留。新目标用 /goal <描述>）${C.reset || ''}`
+  }
+
+  // ── 模型提议的目标（ProposeGoal）──
+  //
+  // 模型读完代码后提议一个带完成判据的版本，用户按一下采纳。
+  // 提议**不生效、不消耗预算**，只是待批文件 —— 控制权始终在用户手里。
+  if (sub === 'proposal' || sub === 'propose') {
+    const p = loadProposal(sid)
+    if (!p) return '当前没有待批准的目标提议。'
+    return [
+      `${C.cyan || ''}模型提议的目标（未生效）${C.reset || ''}`,
+      `  目标：${p.objective}`,
+      `  完成判据：${p.condition}`,
+      ...(p.boundaries?.length ? [`  边界：${p.boundaries.join('；')}`] : []),
+      `  预算：${p.budgetTurns} 轮`,
+      '',
+      `${C.dim || ''}/goal approve 采纳并开始推进 · /goal reject 拒绝${C.reset || ''}`,
+    ].join('\n')
+  }
+
+  if (sub === 'approve') {
+    const p = loadProposal(sid)
+    if (!p) return '当前没有待批准的目标提议。'
+    const r = approveProposal(sid, { tokensAtStart: ctx.getTokens?.() || 0 })
+    if (!r.ok) return r.error
+    const s = snapshot(sid)
+    return {
+      __startGoal: true,
+      text: `${C.cyan || ''}▸ 已采纳提议，开始推进${C.reset || ''}\n${card(sid, ctx)}`,
+      message: [
+        '（goal mode 启动 · 用户已批准你提议的完成契约）',
+        '这是第 1 个 goal turn。先确认理解目标与判据，然后开始做第一个有界切片。',
+        '',
+        buildGoalContract(s),
+      ].join('\n'),
+    }
+  }
+
+  if (sub === 'reject' || sub === 'deny') {
+    const p = clearProposal(sid)
+    if (!p) return '当前没有待批准的目标提议。'
+    return `已拒绝提议：${p.objective}\n${C.dim || ''}（没有创建任何目标。要自己设定用 /goal <描述>）${C.reset || ''}`
   }
 
   if (sub === 'pause') {

@@ -150,6 +150,63 @@ function saveGoal(sessionId, g) {
   return g
 }
 
+// ── ProposeGoal：模型提议，用户批准 ─────────────────────────────────
+//
+// 提议单独存一个文件（`<session>.proposal.json`），不碰 goal 文件本身。
+// 理由：提议是「候选」，goal 文件是「已生效的契约」。混在一起的话
+// loadGoal 会读到一个未批准的目标并开始自动续轮 —— 那正是原设计
+// 禁止「模型自己创建目标」要防的事。
+function proposalFileFor(sessionId) {
+  const safe = String(sessionId || 'default').replace(/[^\w.-]/g, '_') || 'default'
+  return join(ROOT, `${safe}.proposal.json`)
+}
+
+/** 写入一条待批准提议（覆盖旧的：同一时刻只留最新一条提议） */
+export function writeProposal(sessionId, proposal) {
+  ensureRoot()
+  atomicWrite(proposalFileFor(sessionId), JSON.stringify(proposal, null, 2))
+  return proposal
+}
+
+/** 读待批准提议；没有返回 null */
+export function loadProposal(sessionId) {
+  try {
+    const f = proposalFileFor(sessionId)
+    if (!existsSync(f)) return null
+    const p = JSON.parse(readFileSync(f, 'utf-8'))
+    if (!p || typeof p !== 'object' || !p.condition) return null
+    return p
+  } catch { return null }
+}
+
+/** 丢掉待批准提议（批准后或用户拒绝后都调） */
+export function clearProposal(sessionId) {
+  const p = loadProposal(sessionId)
+  try { unlinkSync(proposalFileFor(sessionId)) } catch {}
+  return p
+}
+
+/**
+ * 把待批准提议变成真正的 goal。
+ *
+ * 这是**用户动作**（`/goal approve`）的唯一入口 —— 模型调不到它，
+ * 因为 ProposeGoal 工具只写提议、不调这个函数。
+ */
+export function approveProposal(sessionId, { tokensAtStart = 0 } = {}) {
+  const p = loadProposal(sessionId)
+  if (!p) return { ok: false, error: '没有待批准的提议' }
+  const r = createGoal(sessionId, {
+    objective: p.objective,
+    completion: p.condition,
+    boundaries: p.boundaries || [],
+    turns: p.budgetTurns,
+    tokensAtStart,
+    replace: true,
+  })
+  if (r.ok) clearProposal(sessionId)
+  return r
+}
+
 /** 补全旧版本/手改文件缺的字段，保证后续代码不用到处判空 */
 function normalize(g) {
   g.status = GOAL_STATUS.includes(g.status) ? g.status : 'active'

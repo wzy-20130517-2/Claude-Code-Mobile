@@ -35,6 +35,8 @@ export function buildStatusReport({
   incognito = false,
   autoDaemon = null,
   bgTasks = 0,
+  // 只在 /status probe 时传入（探测结果），默认 null = 不显示这一节
+  connectivity = null,
   node = process.version,
   platform = `${process.platform} ${process.arch}`,
 } = {}) {
@@ -55,7 +57,8 @@ export function buildStatusReport({
     ['协议', protocol],
   ]
   if (thinking) {
-    modelRows.push(['思考', thinking.enabled ? `开启 · ${thinking.effort || 'high'}${thinking.show === false ? ' · 不显示' : ''}` : '关闭'])
+    // effort 未设置 = auto 档（/effort auto），别显示成 high
+    modelRows.push(['思考', thinking.enabled ? `开启 · ${thinking.effort || 'auto'}${thinking.show === false ? ' · 不显示' : ''}` : '关闭'])
   }
   if (thinkingPolicy) modelRows.push(['实际请求', thinkingPolicy])
   if (keys) modelRows.push(['API Key', keys])
@@ -97,7 +100,107 @@ export function buildStatusReport({
   if (bgTasks > 0) toolRows.push(['后台任务', `${bgTasks} 个运行中`])
   sections.push({ title: '工具', rows: toolRows })
 
+  // API 连通性只在探测过时才出现 —— /status 默认必须秒回，
+  // 一次网络往返就能让它在弱网下卡满超时，用户只是想看一眼模型名。
+  if (connectivity) {
+    sections.push({ title: 'API 连通性', rows: formatConnectivityRows(connectivity) })
+  }
+
   return { sections }
+}
+
+/** 探测超时。官方没有这个命令，取 3s：比正常首字节（实测中位 13.6s 是流式首 token，
+ *  这里是 5 token 的非流式小请求，正常几百 ms）宽裕，又不至于让用户等得不耐烦。 */
+export const PROBE_TIMEOUT_MS = 3000
+
+/**
+ * 主动探测当前 Provider 的 API 连通性。
+ *
+ * 【为什么不直接返回 testConnection 的 error 字符串】
+ * "HTTP 401: {...}" 和 "fetch failed" 对用户的意义完全不同：前者是 key/额度问题，
+ * 后者是网络/域名问题。只报「失败」等于让用户自己猜。这里统一归类成
+ * ok / timeout / http / network / nokey / error 六种，并保留原始细节。
+ *
+ * 【绝不切换 Provider】这个函数只读不写，探测失败只报告，切换是用户的决定。
+ *
+ * @param {object} o
+ * @param {(timeoutMs:number)=>Promise<{ok:boolean,error?:string}>} o.probe
+ *        ApiClient.testConnection 的绑定版本，由调用方注入（便于测试）
+ * @param {number} [o.timeoutMs]
+ * @returns {Promise<{ok:boolean, kind:string, detail:string, ms:number}>}
+ */
+export async function probeApiConnectivity({ probe, timeoutMs = PROBE_TIMEOUT_MS } = {}) {
+  const started = Date.now()
+  if (typeof probe !== 'function') {
+    return { ok: false, kind: 'error', detail: '当前没有可用的 API 客户端', ms: 0 }
+  }
+  let result
+  try {
+    // 外层再包一层 race：testConnection 自己的 AbortController 对 DNS 卡死不一定立刻生效，
+    // 而 /status 是交互命令，绝不能无限期挂着。
+    result = await Promise.race([
+      Promise.resolve(probe(timeoutMs)),
+      new Promise(res => setTimeout(
+        () => res({ ok: false, error: `连接超时 (${timeoutMs}ms)` }),
+        timeoutMs + 500,
+      )),
+    ])
+  } catch (e) {
+    result = { ok: false, error: e?.message || String(e) }
+  }
+  const ms = Date.now() - started
+  if (result?.ok) return { ok: true, kind: 'ok', detail: '', ms }
+
+  const err = String(result?.error || '未知错误')
+  return { ok: false, kind: classifyProbeError(err), detail: err, ms }
+}
+
+/** 把探测错误归类（导出便于单测） */
+export function classifyProbeError(err) {
+  const s = String(err || '')
+  if (/连接超时|timeout|timed out|AbortError|ETIMEDOUT/i.test(s)) return 'timeout'
+  if (/HTTP\s*\d{3}/i.test(s) || /\b(401|403|404|429|5\d\d)\b/.test(s)) return 'http'
+  if (/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|fetch failed|network|socket hang up/i.test(s)) return 'network'
+  if (/no api key|未配置.*key|apiKey.*(为空|missing)/i.test(s)) return 'nokey'
+  return 'error'
+}
+
+const PROBE_KIND_LABEL = {
+  ok: '正常',
+  timeout: '超时',
+  http: 'HTTP 错误',
+  network: '网络错误',
+  nokey: '未配置 key',
+  error: '失败',
+}
+
+/**
+ * 各类失败该往哪儿查。
+ *
+ * 为什么要这段：底层抛出的原始消息经常只有 "fetch failed" 三个词 ——
+ * 真正的 cause（bad port / ENOTFOUND / cert 过期）在 e.cause 里，
+ * 而 testConnection 只透传 e.message。这里不改 api.mjs（它被多处共用），
+ * 在展示层补一句方向，让用户知道该看 URL、看网络、还是看 key。
+ */
+const PROBE_KIND_HINT = {
+  timeout: '请求没在超时内返回：网关可能在排队，或网络极慢',
+  http: '看详情里的状态码：401/403 = key 或权限，429 = 限流，5xx = 服务端',
+  network: '连不上：检查 URL 是否可达、端口对不对、是否需要代理',
+  nokey: '这个 Provider 没有配 API key',
+  error: '看详情原文',
+}
+
+/** 探测结果 → 状态行（导出便于单测） */
+export function formatConnectivityRows(c) {
+  if (!c) return []
+  const label = PROBE_KIND_LABEL[c.kind] || '失败'
+  const rows = [['结果', `${c.ok ? '✓ ' : '✗ '}${label}${c.ms != null ? `  ${c.ms}ms` : ''}`]]
+  if (!c.ok && c.detail) rows.push(['详情', String(c.detail).slice(0, 200)])
+  if (!c.ok) {
+    const hint = PROBE_KIND_HINT[c.kind]
+    if (hint) rows.push(['排查', hint])
+  }
+  return rows
 }
 
 /** 渲染成终端文本 */

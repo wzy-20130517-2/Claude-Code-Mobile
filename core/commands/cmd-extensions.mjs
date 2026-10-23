@@ -2,7 +2,7 @@
 // 新增命令：/context, /diff, /doctor, /stats, /memory, /branch, /rewind, /permissions
 import { execFileSync, execSync } from 'node:child_process'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync, unlinkSync, statSync } from 'node:fs'
-import { resolve, join } from 'node:path'
+import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { randomBytes } from 'node:crypto'
 import { atomicWrite } from '../infra/atomic.mjs'
@@ -12,6 +12,8 @@ import { listPlugins, enablePlugin, disablePlugin } from '../integrations/plugin
 import { probePort } from '../api/status-probe.mjs'
 import { renderWordDiff } from '../ui/word-diff.mjs'
 import { normalizeProviderUrl } from '../api/provider-url.mjs'
+// /config key=value 的 markdownTheme 分支要真的换色（只写配置字段不生效）
+import { setMarkdownTheme, markdownThemeNames } from '../ui/markdown.mjs'
 
 // ── 配置事件缓冲 ──────────────────────────────
 // /config 切换、/model /url /key 等改配置的操作会把结果写进这里，
@@ -138,6 +140,121 @@ export function cmdContext(agent, maxContextTokens = null) {
     line(),
     line(status),
     sep('└', '', '┘'),
+  ].join('\n')
+}
+
+/**
+ * /context all —— 上下文明细（对齐官方 2.1.303 的 `[all]`）
+ *
+ * 【与 cmdContext 的分工】cmdContext 回答「占了多少」，这里回答「被谁占了」。
+ * 用户遇到「明明没几条消息，上下文却快满了」时，总量条完全帮不上忙 ——
+ * 真正的大户往往是系统提示词、工具定义、MCP 工具、skill frontmatter，
+ * 它们在消息计数里一个都不出现。
+ *
+ * 【为什么分类要靠注入而不是自己算】
+ *   · 系统提示词  —— 只有调用方知道当前拼出来的是哪一份（会随 provider/权限变）
+ *   · 工具定义    —— 同上，registry 在 index.mjs 里
+ *   · 上下文文件  —— contextFiles 也在外层
+ * 所以这些都从 opts 里拿，拿不到就标「未统计」，**不编造数字**。
+ * 这条是本项目一贯的规矩：宁可少给一栏，也不给一个看起来精确的假值。
+ *
+ * @param {object} agent
+ * @param {number} maxContextTokens
+ * @param {object} opts
+ *   systemPrompt   () => string          当前系统提示词全文
+ *   toolSchemas    () => object[]        注册中的工具定义（用于估 token）
+ *   contextFiles   () => string[]        已加载的上下文文件路径
+ *   skills         () => object[]        skill 列表（含 description）
+ */
+export function cmdContextDetail(agent, maxContextTokens = null, opts = {}) {
+  const history = agent.getHistory()
+  // 与 cmdContext 同一套粗估规则（中英混合约 2 字符/token），
+  // 两个命令的估算必须一致 —— 否则 /context 与 /context all 给出互相矛盾的数字。
+  const estimate = (text) => Math.round(String(text || '').length / 2)
+
+  const msgChars = (m) => {
+    const c = m?.content
+    if (typeof c === 'string') return c.length
+    if (!Array.isArray(c)) return 0
+    let n = 0
+    for (const b of c) {
+      if (typeof b === 'string') n += b.length
+      else if (b?.text) n += String(b.text).length
+      else if (b?.content) n += String(b.content).length
+      else if (b?.type === 'image' || b?.type === 'image_url') n += 6000  // 图片粗算（按 3000 token）
+    }
+    return n
+  }
+
+  // 按角色拆历史：用户 / 助手 / 工具结果 三类的占比是排查「谁把上下文撑满」的关键
+  let userChars = 0, assistantChars = 0, toolChars = 0
+  for (const m of history) {
+    const n = msgChars(m)
+    if (m?.role === 'user') userChars += n
+    else if (m?.role === 'assistant') assistantChars += n
+    else if (m?.role === 'tool' || m?.role === 'function') toolChars += n
+    else userChars += n
+  }
+
+  const fmt = (n) => Number(n).toLocaleString('en-US')
+  const rows = []
+  const row = (label, tokens, note = '') => {
+    rows.push(`  ${label.padEnd(16)}${fmt(tokens).padStart(10)} tokens${note ? `  ${note}` : ''}`)
+  }
+
+  row('用户消息', Math.round(userChars / 2), `(${history.filter(m => m?.role === 'user').length} 条)`)
+  row('助手消息', Math.round(assistantChars / 2), `(${history.filter(m => m?.role === 'assistant').length} 条)`)
+  if (toolChars > 0) row('工具结果', Math.round(toolChars / 2), '(可 /compact micro 回收)')
+
+  let sysTokens = null
+  try {
+    const sp = typeof opts.systemPrompt === 'function' ? opts.systemPrompt() : ''
+    if (sp) { sysTokens = estimate(sp); row('系统提示词', sysTokens, '(每轮都发)') }
+  } catch {}
+
+  let toolTokens = null
+  try {
+    const schemas = typeof opts.toolSchemas === 'function' ? opts.toolSchemas() : null
+    if (Array.isArray(schemas)) {
+      toolTokens = estimate(JSON.stringify(schemas))
+      row('工具定义', toolTokens, `(${schemas.length} 个)`)
+    }
+  } catch {}
+
+  let skillTokens = null
+  try {
+    const list = typeof opts.skills === 'function' ? opts.skills() : null
+    if (Array.isArray(list) && list.length) {
+      // skill 在上下文里只贡献 name + description（正文是按需展开的），
+      // 所以这里只估这两段，不把 body 算进去 —— 算了会严重高估。
+      skillTokens = estimate(list.map(s => `${s.name} ${s.description || ''}`).join('\n'))
+      row('skill 索引', skillTokens, `(${list.length} 个，仅名字+描述)`)
+    }
+  } catch {}
+
+  const files = (() => {
+    try { return typeof opts.contextFiles === 'function' ? (opts.contextFiles() || []) : [] } catch { return [] }
+  })()
+  if (files.length) {
+    rows.push(`  上下文文件${' '.repeat(6)}${String(files.length).padStart(10)} 个`)
+    for (const f of files.slice(0, 10)) rows.push(`    ${f}`)
+    if (files.length > 10) rows.push(`    … 另有 ${files.length - 10} 个`)
+  }
+
+  const total = Math.round((userChars + assistantChars + toolChars) / 2)
+    + (sysTokens || 0) + (toolTokens || 0) + (skillTokens || 0)
+  const max = Number(maxContextTokens) > 0 ? Number(maxContextTokens) : 1000000
+  const pct = max > 0 ? Math.min(100, Math.round(total / max * 100)) : 0
+
+  return [
+    '上下文明细（/context all）',
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+    ...rows,
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+    `  ${'合计'.padEnd(14)}${fmt(total).padStart(10)} tokens  ≈ ${pct}% / ${fmt(max)}`,
+    '',
+    '注：以上为按字符数粗估（中英混合约 2 字符/token），与 API 回报的 prompt_tokens',
+    '会有偏差；要看**精确值**用 /context（取的是最近一次请求的 prompt_tokens）。',
   ].join('\n')
 }
 
@@ -613,6 +730,18 @@ export function cmdBranch(sessionStore, sessionId, agent, todos, args) {
 // /rewind — 检查点恢复（增强版 undo）
 // 列出最近的可恢复点，或恢复到指定点
 export function cmdRewind(multiUndo, agent, sessionStore, sessionId, args) {
+  // `/rewind undo` —— 一步撤销最近一次改动（对齐官方 2.1.303 把 undo 列为 rewind 别名）
+  //
+  // 【为什么做成子命令而不是 COMMAND_ALIASES 里的 undo → rewind 映射】
+  // CCM 的 /undo 是独立命令（立即撤销，一步到位），而 /rewind 的默认动作是
+  // **列检查点**（两步：先看列表，再挑一个恢复）。把 undo 映射成 rewind
+  // 等于把「一步」变成「两步」，是行为退化。
+  // 所以这里给 rewind 加一个 undo 子命令：想用官方拼法的人敲 /rewind undo
+  // 得到的就是「撤销最近一次」，与 /undo 完全等价。
+  if (args[0] === 'undo') {
+    const results = multiUndo.undo()
+    return results.length > 0 ? results.join('\n') : '没有可撤销的操作'
+  }
   if (args[0] === 'list' || !args[0]) {
     const snaps = multiUndo.listSnapshots(50)
     if (snaps.length === 0) return '没有可恢复的检查点。\n修改文件后会自动创建快照。'
@@ -674,7 +803,41 @@ export function cmdRewind(multiUndo, agent, sessionStore, sessionId, args) {
     agent.setHistory(kept)
     return `已回退 ${n} 条消息（当前 ${kept.length} 条）`
   }
-  return '用法:\n  /rewind             列出文件检查点\n  /rewind file <序号>  恢复文件到检查点\n  /rewind diff <序号>  查看检查点与当前文件的差异\n  /rewind msgs <N>    回退 N 条消息'
+  return '用法:\n  /rewind             列出文件检查点\n  /rewind undo        撤销最近一次改动（等价 /undo，一步到位）\n  /rewind file <序号>  恢复文件到检查点\n  /rewind diff <序号>  查看检查点与当前文件的差异\n  /rewind msgs <N>    回退 N 条消息'
+}
+
+/**
+ * /code-review —— 代码审查（官方 2.1.303 的正式名，/review 是它的别名）
+ *
+ * 【为什么不是新写一套】官方 2.1.303 把 code-review 做成了打包 skill
+ * （`subcommands: { ultra: "ultrareview" }`，即 `/code-review ultra` 转发到
+ * /ultrareview）。那是生态功能（云端 ultrareview），按本轮范围排除。
+ *
+ * CCM 已有的 /review 是**本地静态扫描**（git 状态、可疑文件、超大文件、
+ * .gitignore 检查），不调 API、零成本。这个能力本身有价值，只是名字
+ * 和官方不一致。所以：
+ *   · 名字对齐官方 —— /code-review 是正式入口
+ *   · /review 保留为别名（历史会话、CLAUDE.md 里到处都是）
+ *   · 两者的实现是**同一份** cmdReview，不存在漂移
+ *
+ * 【为什么不加 ultra 子命令】那是订阅计费 + 云端服务，本轮明确排除。
+ * 敲 /code-review ultra 会得到一句「本机没有这个子命令」+ 现有能力提示，
+ * 而不是静默当成普通 review 跑一遍（那会让用户以为 ultra 生效了）。
+ */
+export function cmdCodeReview(args) {
+  const sub = String(args[0] || '').toLowerCase()
+  if (sub === 'ultra') {
+    return [
+      '/code-review ultra 是官方的云端深度审查（订阅功能），CCM 没有这条路径。',
+      '',
+      '本机能做的是本地静态扫描：',
+      '  /code-review         扫描工作区（git 状态 / 可疑文件 / 超大文件 / .gitignore）',
+      '',
+      '需要「模型视角的审查」时，直接说「审查一下 xxx 的改动」即可 ——',
+      '那是主对话用 Read/Grep/GitDiff 现看，比云端服务更贴近当前上下文。',
+    ].join('\n')
+  }
+  return cmdReview(args)
 }
 
 // /plugins — 查看/启用/禁用内置插件
@@ -742,35 +905,62 @@ export function cmdPermissions(args) {
 }
 
 // /copy — 复制最后一条助手回复到剪贴板
-export function cmdCopy(agent) {
+/**
+ * /copy [N] —— 复制助手回复到剪贴板。
+ *
+ * 官方：`Copy Claude's last response to clipboard (or /copy N for the Nth-latest)`。
+ * CCM 原来只取最后一条，N 这个用法敲了会被当成无参（args 根本没往下传）。
+ *
+ * 【N 的语义】N 是「倒数第 N 条」，从 1 开始：
+ *   /copy 或 /copy 1 → 最后一条
+ *   /copy 2          → 倒数第二条
+ * 与官方一致。越界给出明确提示（并告知总共有几条），不要静默复制错的。
+ */
+export function cmdCopy(agent, args = []) {
   const history = agent.getHistory()
-  // 找最后一条 assistant 消息
+  // 收集所有非空 assistant 文本，从新到旧
+  const texts = []
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i]
-    if (m.role === 'assistant') {
-      const content = typeof m.content === 'string' ? m.content
-        : Array.isArray(m.content) ? m.content.filter(b => b.type === 'text').map(b => b.text).join('\n')
-        : ''
-      if (content) {
-        try {
-          // 数组传参、不走 shell，避免内容含 $ ` ; 时命令注入
-          // 路径探测：Termux 在 $PREFIX/bin，CCM(proot) 里没有（走桥）
-          const prefix = process.env.PREFIX || '/data/data/com.termux/files/usr'
-          const candidates = [
-            `${prefix}/bin/termux-clipboard-set`,
-            '/data/data/com.termux/files/usr/bin/termux-clipboard-set',
-          ]
-          const bin = candidates.find(c => { try { return existsSync(c) } catch { return false } })
-          if (!bin) return '剪贴板不可用（Termux 需装 termux-api；CCM 走原生桥）'
-          execFileSync(bin, [content], { timeout: 5000 })
-          return `已复制最后一条回复到剪贴板 (${content.length} 字符)`
-        } catch (e) {
-          return `复制失败: ${e.message}`
-        }
-      }
+    if (m.role !== 'assistant') continue
+    const content = typeof m.content === 'string' ? m.content
+      : Array.isArray(m.content) ? m.content.filter(b => b.type === 'text').map(b => b.text).join('\n')
+      : ''
+    if (content) texts.push(content)
+  }
+  if (texts.length === 0) return '没有可复制的助手回复'
+
+  // 解析 N（省略 = 1）
+  const raw = Array.isArray(args) ? String(args[0] ?? '').trim() : String(args ?? '').trim()
+  let n = 1
+  if (raw) {
+    if (!/^\d+$/.test(raw)) {
+      return `用法: /copy（最后一条）或 /copy N（倒数第 N 条，N 从 1 开始）`
+    }
+    n = parseInt(raw, 10)
+    if (n < 1) return 'N 必须 ≥ 1（1 = 最后一条）'
+    if (n > texts.length) {
+      return `只有 ${texts.length} 条助手回复，取不到倒数第 ${n} 条`
     }
   }
-  return '没有可复制的助手回复'
+
+  const content = texts[n - 1]
+  try {
+    // 数组传参、不走 shell，避免内容含 $ ` ; 时命令注入
+    // 路径探测：Termux 在 $PREFIX/bin，CCM(proot) 里没有（走桥）
+    const prefix = process.env.PREFIX || '/data/data/com.termux/files/usr'
+    const candidates = [
+      `${prefix}/bin/termux-clipboard-set`,
+      '/data/data/com.termux/files/usr/bin/termux-clipboard-set',
+    ]
+    const bin = candidates.find(c => { try { return existsSync(c) } catch { return false } })
+    if (!bin) return '剪贴板不可用（Termux 需装 termux-api；CCM 走原生桥）'
+    execFileSync(bin, [content], { timeout: 5000 })
+    const which = n === 1 ? '最后一条' : `倒数第 ${n} 条`
+    return `已复制${which}回复到剪贴板 (${content.length} 字符)`
+  } catch (e) {
+    return `复制失败: ${e.message}`
+  }
 }
 
 // /temperature — 设置 API 温度
@@ -790,18 +980,24 @@ export function cmdTemperature(args, config, api, saveConfig) {
   return `温度已设为: ${v}`
 }
 
-// /add-dir — 添加多个工作目录
-const EXTRA_DIRS_KEY = '__extraDirs'
-let extraDirs = []
-export function getExtraDirs() { return extraDirs }
-export function cmdAddDir(args) {
-  if (!args[0]) return `可用目录:\n  ${[process.cwd(), ...extraDirs].join('\n  ')}`
-  const newDir = resolve(args[0])
-  if (!existsSync(newDir)) return `目录不存在: ${newDir}`
-  if (extraDirs.includes(newDir)) return `已在列表中: ${newDir}`
-  extraDirs.push(newDir)
-  return `已添加: ${newDir}\n当前工作目录:\n  ${[process.cwd(), ...extraDirs].join('\n  ')}`
-}
+// 【2026-10-22 删除 /add-dir】
+//
+// 它一直是无效命令：cmdAddDir 把路径 push 进模块级数组 extraDirs，
+// 而 getExtraDirs() 全文零调用，文件工具也没有任何目录白名单 ——
+// core/tools/file-tools.mjs 的 toolPath() 只有一行 `resolve(ctx.cwd || process.cwd(), filePath)`，
+// Read/Write/Edit/Glob/Grep 对任何绝对路径都直接放行（实测 grep
+// allowedDirs|whitelist|allowlist|allowedPaths|sandboxRoot 在 core/ 下零命中，
+// core/permission/ 只有 bash 命令的 AST 解析，不管文件路径）。
+//
+// 也就是说：CCM 本来就没有「可读目录」这个概念，/add-dir 加进去的目录
+// 从来没有被任何工具读过，命令返回的「已添加」纯属误导，而且不落盘、重启即丢。
+//
+// 为什么不选「把 extraDirs 接进文件工具」：那等于给一个当前完全开放的
+// 文件系统凭空加一道白名单，会把「读 /sdcard 任意路径」「读 ~/.claude」这类
+// 现有正常用法全部拦掉 —— 为了保住一条命令而制造一个假机制，代价远大于收益。
+// 真要限制目录该是独立设计（配合 /permissions 的 deny 规则），不该由 /add-dir 顺手带上。
+//
+// 替代：/workspace [路径] 设置主工作区（写 config.json，注入系统提示词，真实生效）。
 
 function normalizeProviderMaxOutputTokens(provider) {
   const value = Number(provider?.maxOutputTokens)
@@ -847,7 +1043,9 @@ export function syncActiveProvider(config, api, provider) {
   api.temperature = config.temperature
   // thinking 配置：provider.thinking 优先（每配置独立），没有则 fallback 全局 config.thinking
   const t = provider.thinking || config.thinking || {}
-  api.thinkingConfig = t.enabled ? { enabled: true, effort: t.effort || 'high' } : null
+  // effort 缺失 = auto 档，必须原样传 undefined 而不是补成 'high' ——
+  // 补 high 会让 /effort auto 在切 Provider 后悄悄变回 high（见 api.mjs getThinkingPolicy）
+  api.thinkingConfig = t.enabled ? { enabled: true, ...(t.effort ? { effort: t.effort } : {}) } : null
   // 思考回传开关（/effort replay on|off）：跟 thinkingConfig 同一份配置树。
   // 默认关：只有显式 replay: true 才回传（新建 Provider / 未配置都省上下文）
   api.replayReasoning = t.replay === true
@@ -950,7 +1148,7 @@ export function cmdX11(args, mcpPath = MCP_PATH) {
 }
 
 // /config — 集中查看/切换配置
-export function cmdConfig(args, config, api, saveConfig, onVisionConfig = null) {
+export function cmdConfig(args, config, api, saveConfig, onVisionConfig = null, opts = {}) {
   // /config [ID] test —— 测连通性（发真实请求，消耗少量额度）
   //   /config test      → 当前 Provider（原行为）
   //   /config 6 test    → 指定 Provider（一次性探测器，不切换配置、不动会话）
@@ -1038,6 +1236,18 @@ Commands:
   /effort <档位|off|show|hide>  思考强度（none~max 从低到高）/ 关闭 / 显示开关
   /config stream on|off  流式输出开关
   /config [ID] test      测连通性（ID 省略 = 当前 Provider；带 ID 不切换配置）
+
+按 key 直接设值（顺序无关，可一次给多个；值里有空格时只写一对）:
+  /config stream=off                       等价于 /config stream off
+  /config greeting=off replayHistory=on     一次设两项
+  /config temperature=0.7
+  /config maxContextTokens=200000
+  /config markdownTheme=official
+  /config permissionMode=acceptEdits
+  /config compactThresholdTokens=270000 compactKeepLast=100
+  可用 key: greeting / stream / replayHistory / temperature / maxContextTokens /
+            compactThresholdTokens / compactThresholdMessages / compactKeepLast /
+            markdownTheme / permissionMode
  `
   }
   if (args[0] === 'profile') {
@@ -1284,7 +1494,168 @@ Commands:
     }
     return `未知子命令: ${sub}\n用法: /config stream on|off`
   }
-  return `未知配置项: ${args[0]}`
+
+  // ── /config key=value —— 直接按 key 设值（对齐官方 2.1.303 的 config2）──
+  //
+  // 【为什么加】官方 2.1.303 把 /config 拆成两个实现：交互版开设置面板，
+  // 非交互版 `config2` 的 argumentHint 就是 `key=value`，语义是「按 key 设一项设置」。
+  // CCM 原来只能走子命令（/config stream off、/config greeting on…），
+  // 子命令名各写各的、记不住；而 Agent 调用 / 脚本 / QQ 桥这类**非交互入口**
+  // 根本没有面板可点，key=value 是它们唯一顺手的写法。
+  //
+  // 【解析规则照抄官方 fn22620，不要自己改】：
+  //   · 恰好一个 token 含 `=` → 整串当一个 key=value（value 里可以有空格）
+  //     例：/config statusLine.command=echo hi
+  //   · 否则按空白拆，每个 token 都必须带 `=`；任一不合格**整条失败**
+  // 后者是关键：部分成功会让用户以为全设上了，而实际只设了一半。
+  //
+  // 【key 表是白名单，不是直接写 config 字段】
+  // 直接 `config[key] = value` 最省事，但有两类 key 必须额外动作：
+  //   · markdownTheme  —— 还要调 setMarkdownTheme() 才真的换色（只写字段不生效）
+  //   · permissionMode —— 还要改运行中的 PermissionManager，否则只写盘、当轮不生效
+  // 所以走显式表，每个 key 自己负责「写字段 + 触发副作用」。
+  // 未知 key 一律报错并列出可用 key —— 静默忽略等于让用户以为设上了。
+  if (args.some((a) => String(a).includes('='))) {
+    const pairs = parseConfigPairs(args)
+    if (!pairs) {
+      return `Expected key=value, got "${args.join(' ')}"\n用 /config 看有哪些可用项。`
+    }
+    return pairs
+      .map(({ key, raw }) => applyConfigPair(key, raw, { config, api, saveConfig, hooks: opts.hooks || null }))
+      .join('\n')
+  }
+
+  return `未知配置项: ${args[0]}\n（也可以直接按 key 设值：/config <key>=<value>，见 /config 帮助）`
+}
+
+/**
+ * 解析 `/config a=1 b=2` 的参数列表。
+ *
+ * 规则与官方 fn22620 一致（见上方调用处的注释）。返回 null 表示格式不合法。
+ *
+ * @param {string[]} args
+ * @returns {{key: string, raw: string}[] | null}
+ */
+function parseConfigPairs(args) {
+  const tokens = args.map((a) => String(a))
+  const joined = tokens.join(' ').trim()
+  const withEq = tokens.filter((t) => t.includes('='))
+
+  // 恰好一个 token 带 `=` → 整串当一个 key=value，value 里允许有空格。
+  // 这条是为 `/config statusLine.command=echo hello` 这类带空格的值准备的：
+  // 拆 token 的话 `hello` 会被当成第二个非法参数。
+  if (withEq.length === 1) {
+    const i = joined.indexOf('=')
+    const key = joined.slice(0, i)
+    // key 里不许有空白：`a b=c` 这种明显是用户写错了，别猜他想设哪个
+    if (!key || /\s/.test(key)) return null
+    return [{ key, raw: joined.slice(i + 1) }]
+  }
+
+  const out = []
+  for (const t of tokens) {
+    const i = t.indexOf('=')
+    if (i <= 0) return null   // i<=0：没有 = ，或者 = 在最前面（空 key）
+    out.push({ key: t.slice(0, i), raw: t.slice(i + 1) })
+  }
+  return out.length ? out : null
+}
+
+/** 布尔字面量。中文也收（用户是中文用户，/config stream=关 比 =off 自然） */
+const CONFIG_BOOL_WORDS = {
+  on: true, true: true, yes: true, '1': true, 开: true, 开启: true, 是: true,
+  off: false, false: false, no: false, '0': false, 关: false, 关闭: false, 否: false,
+}
+
+function parseConfigBool(raw) {
+  const v = String(raw).trim().toLowerCase()
+  return Object.prototype.hasOwnProperty.call(CONFIG_BOOL_WORDS, v) ? CONFIG_BOOL_WORDS[v] : null
+}
+
+/**
+ * 把一条 key=value 落到配置上。返回给用户看的一行结果。
+ *
+ * 【为什么不抛异常】多条 key=value 时，一条失败不该让前面的白设 ——
+ * 逐条返回结果，用户能一眼看出哪条没成。这和「解析阶段整条失败」不矛盾：
+ * 解析失败 = 一个都没设（还没开始）；单条失败 = 其余照常（已经开始）。
+ */
+function applyConfigPair(key, raw, ctx) {
+  const k = String(key).trim()
+  const kl = k.toLowerCase()
+  const { config, api, saveConfig, hooks } = ctx
+  const bad = (expect) => `${k}: 需要${expect}，收到 "${raw}"`
+
+  const setBool = (field, label) => {
+    const v = parseConfigBool(raw)
+    if (v === null) return bad('布尔值（on/off、true/false、1/0）')
+    config[field] = v
+    saveConfig(config)
+    return `${label} = ${v ? 'on' : 'off'}`
+  }
+  const setInt = (field, label, min = 0) => {
+    const v = parseInt(raw, 10)
+    if (!Number.isFinite(v) || v < min) return bad(`不小于 ${min} 的整数`)
+    config[field] = v
+    saveConfig(config)
+    return `${label} = ${v}`
+  }
+
+  switch (kl) {
+    // ── 布尔 ──
+    case 'greeting': return setBool('greeting', 'greeting（开场白）')
+    case 'stream': return setBool('stream', 'stream（流式输出）')
+    case 'replayhistory':
+    case 'replay': return setBool('replayHistory', 'replayHistory（进会话显示历史）')
+
+    // ── 数值 ──
+    case 'temperature':
+    case 'temp': {
+      const v = parseFloat(raw)
+      if (!Number.isFinite(v) || v < 0 || v > 2) return bad('0.0 ~ 2.0 之间的数')
+      config.temperature = v
+      if (config.providers?.[config.current]) config.providers[config.current].temperature = v
+      if (api) api.temperature = v
+      saveConfig(config)
+      return `temperature（生成温度） = ${v}`
+    }
+    case 'maxcontexttokens':
+    case 'maxctx': return setInt('maxContextTokens', 'maxContextTokens（上下文上限）', 10000)
+    case 'compactthresholdtokens': return setInt('compactThresholdTokens', 'compactThresholdTokens（自动压缩 token 阈值）')
+    case 'compactthresholdmessages': return setInt('compactThresholdMessages', 'compactThresholdMessages（自动压缩条数阈值）')
+    case 'compactkeeplast': return setInt('compactKeepLast', 'compactKeepLast（压缩保留条数）')
+
+    // ── 枚举（需要额外副作用）──
+    case 'markdowntheme':
+    case 'markdown-theme': {
+      const v = String(raw).trim()
+      if (!markdownThemeNames().includes(v)) {
+        return bad(`以下之一：${markdownThemeNames().join(' | ')}`)
+      }
+      config.markdownTheme = v
+      // 只写字段不生效 —— 渲染器读的是模块内的 currentThemeName
+      setMarkdownTheme(v)
+      saveConfig(config)
+      return `markdownTheme（终端 Markdown 配色） = ${v}`
+    }
+    case 'permissionmode':
+    case 'permission-mode': {
+      const v = String(raw).trim()
+      const MODES = ['default', 'acceptEdits', 'dontAsk', 'plan', 'bypassPermissions']
+      if (!MODES.includes(v)) return bad(`以下之一：${MODES.join(' | ')}`)
+      config.permissionMode = v
+      saveConfig(config)
+      // 运行中的 PermissionManager 有自己的 mode 字段，不通知它的话
+      // 写盘成功但**当轮仍然按旧模式裁决** —— 这类"看起来设上了"最难查。
+      const live = typeof hooks?.setPermissionMode === 'function'
+        ? (() => { try { hooks.setPermissionMode(v); return true } catch { return false } })()
+        : false
+      return `permissionMode（权限模式） = ${v}${live ? '' : '\n  注：运行中的权限管理器未同步，重启后生效（或用 /permissions mode ' + v + '）'}`
+    }
+
+    default:
+      return `未知 key: ${k}\n可用: greeting / stream / replayHistory / temperature / maxContextTokens / `
+        + `compactThresholdTokens / compactThresholdMessages / compactKeepLast / markdownTheme / permissionMode`
+  }
 }
 
 

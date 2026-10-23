@@ -23,7 +23,7 @@
 export function makePermissionsCommand(ctx) {
   return {
     async permissions(args) {
-        // 扩展：/permissions mode <default|acceptEdits|plan|bypassPermissions>
+        // 扩展：/permissions mode <default|acceptEdits|dontAsk|plan|bypassPermissions>
         if (args[0] === 'mode') {
           if (!args[1]) {
             // 无参数 → select 选模式，四个模式名又长又容易拼错
@@ -33,10 +33,11 @@ export function makePermissionsCommand(ctx) {
               items: [
                 { value: 'default', label: 'default', hint: `装饰性工具硬拒绝${cur === 'default' ? '  ← 当前' : ''}` },
                 { value: 'acceptEdits', label: 'acceptEdits', hint: `写文件自动放行${cur === 'acceptEdits' ? '  ← 当前' : ''}` },
+                { value: 'dontAsk', label: 'dontAsk', hint: `不提示也不自动批准，未预授权的一律拒绝${cur === 'dontAsk' ? '  ← 当前' : ''}` },
                 { value: 'plan', label: 'plan', hint: `只放行只读工具${cur === 'plan' ? '  ← 当前' : ''}` },
                 { value: 'bypassPermissions', label: 'bypassPermissions', hint: `全放行${cur === 'bypassPermissions' ? '  ← 当前' : ''}` },
               ],
-              initial: ['default', 'acceptEdits', 'plan', 'bypassPermissions'].indexOf(cur),
+              initial: ['default', 'acceptEdits', 'dontAsk', 'plan', 'bypassPermissions'].indexOf(cur),
             })
             if (picked == null) return '已取消'
             const m = ctx.permManager.setMode(picked)
@@ -53,7 +54,7 @@ export function makePermissionsCommand(ctx) {
           ctx.agent.systemPrompt = ctx.getCurrentSystemPrompt()
           return `已重载: commands=${ctx.customCommands.list().length} agents=${ctx.customAgents.list().length}`
         }
-        return ctx.cmdPermissions(args) + `\n\n当前模式: ${ctx.permManager.getMode()}\n  /permissions mode <default|acceptEdits|plan|bypassPermissions>`
+        return ctx.cmdPermissions(args) + `\n\n当前模式: ${ctx.permManager.getMode()}\n  /permissions mode <default|acceptEdits|dontAsk|plan|bypassPermissions>`
     },
   }
 }

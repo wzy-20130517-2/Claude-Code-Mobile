@@ -321,7 +321,7 @@ export function buildWebCtx(runtime, deps = {}) {
     getTokens: deps.getTokens,
     // 子 agent 刷新（/agents 用）
     onReload: deps.onReload,
-    // 受保护路径判断（/add-dir 用）
+    // 受保护路径判断（incognito 下禁止读写 claude-code-mobile 目录）
     isProtectedPath: deps.isProtectedPath ?? (() => false),
     // QQ 桥（/qq 用）。
     // 【2026-09-24 更新】Web/CCM 现在也有桥了（web/qq-integration.mjs）。

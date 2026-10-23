@@ -1,5 +1,49 @@
 // Claude Code Mobile - Hook 系统
-// 支持事件：SessionStart, SessionEnd, PreToolUse, PostToolUse, UserPromptSubmit, PreCompact, PostCompact, Stop
+//
+// 支持事件：
+//   SessionStart, SessionEnd, UserPromptSubmit,
+//   PreToolUse, PostToolUse, PostToolUseFailure,   ← 后两个互斥（成功/失败）
+//   PermissionDenied,                             ← 权限拒绝 / PreToolUse deny（观察类）
+//   PreCompact, PostCompact, Stop,
+//   SubagentStart, SubagentStop,
+//   FileChanged                                 ← 尚无触发源，见下方说明
+//
+// 【FileChanged 为什么列在这里但没有触发点】
+// 官方（Claude Code）有这个事件，用于「文件被编辑器等外部程序改动」时通知 hook。
+// CCM 侧的手机场景（MT 管理器改文件）也确实存在，但**当前没有任何文件监听
+// 机制**：全仓库搜不到 fs.watch / fs.watchFile / chokidar。
+//
+// 不补触发源的两个原因：
+//   1) fs.watch 在 Android/sdcard（FAT32/exfat）上不可靠 —— 同一文件会重复
+//      事件、改 mtime 不触发、目录级监听直接失效；
+//   2) 轮询 mtime 要常驻定时器，白烧 CPU 和电量，而收益只是「知道文件被改了」。
+//
+// 所以：事件表里有它（用户可以配置，trigger() 按事件名查表即可生效），
+// 但**配置了也不会触发**。这里如实写明，不假装它能跑。
+// 真要启用时的前提：先有一个可靠的文件监听源（或用户明确接受轮询代价）。
+//
+// 【2026-10-20 补 SubagentStart/SubagentStop】这两个事件从 2026-09 起就在
+// `core/agent/plan.mjs` 有真实触发点（子 Agent 启动/收尾），但文件头没列、
+// `/hooks` 命令也不显示 —— 用户看文档以为不支持，实际上配了就能用。
+// 声明落后于实现同样是缺陷：它让可用能力变成"没人知道的隐藏功能"。
+//
+// 【为什么 PostToolUseFailure 单独一个事件（对齐官方 2.1.303）】
+// 官方 hooks 事件表里 PostToolUse 与 PostToolUseFailure 是独立两项。
+// 合并成一个事件的坏处：hook 脚本只能自己嗅输出里有没有 error 字样，
+// 而那个启发式会误判（grep 无匹配 exit 1、文件名里带 error 都会被误杀）。
+// 拆开后由 agent 层用工具声明的 __ok（Bash 走真实 exitCode）判定，
+// 失败 hook 可以单独配「通知/回滚/打日志」，不必在每条 hook 里写 if。
+//
+// 【为什么 trigger() 本身是事件无关的】它按事件名去 hooks.json / skillHooks
+// 里查表，新事件**不需要**在这里加分支。这份清单是给人和 /hooks 命令看的
+// 文档性约定，新增事件时同步更新这里即可。
+//
+// 【PermissionDenied（2026-10-23 补）】对齐官方独立事件，schema 为
+// {tool_name, tool_input, tool_use_id, reason, mcp_server?}。
+// 两条触发路径都在 core/agent/agent.mjs：权限判定拒绝、PreToolUse hook deny。
+// 观察类事件（无 deny/block 语义）—— 工具拒绝本身由 agent 决定，hook 只知情。
+// 为什么 reason 值得单独给：官方把「为什么被拒」显式传出来，hook 脚本
+// 才能区分「权限规则拒的」和「PreToolUse hook 拒的」，否则只能嗅字符串。
 import { exec } from 'node:child_process'
 import { HOOKS_PATH } from './paths.mjs'
 import { existsSync, readFileSync } from 'node:fs'
@@ -78,6 +122,48 @@ export class HookManager {
       this.logger.warn && this.logger.warn(`[Hooks] ${e.message}`)
       return {}
     }
+  }
+
+  /**
+   * 重新从磁盘读 hooks.json（供 /hooks edit 保存后热重载）。
+   *
+   * 【为什么不直接用 _loadConfig】它解析失败时返回 `{}` 并只打一条 warn ——
+   * 那对启动阶段是合理的（没配置就等于没 hook），但对「用户刚编辑完」的场景
+   * 是灾难：JSON 写坏了会被静默当成「没有任何 hook」，用户以为保存成功了，
+   * 实际所有 hook 全部失效。所以这里把错误**抛出去**，由调用方决定保留旧配置。
+   *
+   * 【skillHooks 不动】它们是 skill 激活期内的临时层，生命周期与 hooks.json
+   * 无关。热重载只该刷新常驻配置那一层。
+   *
+   * @returns {{ok: true, events: number, entries: number} | {ok: false, error: string}}
+   */
+  reload() {
+    let raw
+    try {
+      if (!existsSync(this.configPath)) {
+        // 文件被删掉了 = 用户就是想清空，这是合法结果
+        this.hooks = {}
+        return { ok: true, events: 0, entries: 0 }
+      }
+      raw = readFileSync(this.configPath, 'utf-8')
+    } catch (e) {
+      return { ok: false, error: `读取失败: ${e.message}` }
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch (e) {
+      return { ok: false, error: `JSON 解析失败: ${e.message}` }
+    }
+    // 顶层必须是对象。数组/null 都能过 JSON.parse，但后面 _entriesFor
+    // 用 this.hooks[event] 取值，null 会抛 TypeError（静默变成"没有 hook"）。
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, error: '顶层必须是对象（形如 {"PreToolUse": [...]}）' }
+    }
+    this.hooks = parsed
+    const events = Object.keys(parsed).filter(k => Array.isArray(parsed[k]) && parsed[k].length > 0)
+    const entries = events.reduce((n, k) => n + parsed[k].length, 0)
+    return { ok: true, events: events.length, entries }
   }
 
   // 触发 hook 事件
@@ -172,6 +258,9 @@ export class HookManager {
       PROMPT: context.prompt || '',
       // Stop
       STOP_REASON: context.reason || '',
+      // PermissionDenied（官方 schema：reason / tool_use_id）
+      PERMISSION_DENIED_REASON: context.reason || '',
+      TOOL_USE_ID: context.toolUseId || '',
       // PreCompact/PostCompact
       TOKEN_COUNT: String(context.tokenCount || ''),
       TOKEN_LIMIT: String(context.tokenLimit || ''),

@@ -170,9 +170,9 @@ export const NON_INTERACTIVE_HINTS = {
   imagegen: '/imagegen url <URL> · key <KEY> · model <名> · size <尺寸> · dir <路径>（别用 /imagegen setup）',
   key: '/key [providerID] <密钥>；多 key 池必须一行给全：/key [id] pool <k1> <k2> ...',
   config: '/config <ID> 直接切换；改配置用 /model /url /name /key（别用无参 /config 选单）',
-  mail: '/mail set <邮箱> <授权码> [imap主机] [端口]，或 /mail user|pass|imap|port <值>',
-  effort: '/effort none|minimal|low|medium|high|xhigh|max，或 off|show|hide（别用无参 /effort）',
-  permissions: '/permissions mode default|acceptEdits|plan|bypassPermissions · allow <工具名>',
+  mail: '/mail add <别名> <邮箱> <授权码> [imap主机] [端口]（别用无参 /mail add 向导）· /mail rm|default <别名> · /mail pass|user|host|port|smtp|smtp-port|note [别名] <值>',
+  effort: '/effort auto|none|minimal|low|medium|high|xhigh|max，或 off|show|hide（别用无参 /effort）',
+  permissions: '/permissions mode default|acceptEdits|dontAsk|plan|bypassPermissions · allow <工具名>',
   agents: '/agents（无参=列表，只读）· /agents new <名字> 生成模板（别指望向导）',
   model: '/model <名称> 改当前 Provider 模型 · /model <id> <名称> 改指定（无参会开选单）',
   // /help 不在这里：它在非交互环境直接返回纯文本清单，不抛 NonInteractiveError。

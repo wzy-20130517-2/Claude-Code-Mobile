@@ -35,13 +35,33 @@ export const BUILTIN_COMMANDS = [
   'help', 'agents', 'cost', 'cache', 'context', 'context7', 'diff', 'doctor', 'review', 'trace',
   'workflow', 'stats', 'todos', 'goal', 'plan', 'deep', 'coordinate', 'cowork', 'watch', 'qq',
   'undo', 'rewind', 'retry', 'branch', 'export', 'skills', 'memory', 'automem', 'permissions',
-  'bg-status', 'bg-list', 'tasks', 'team', 'exit', 'quit', 'clear', 'new', 'incognito',
+  'bg-status', 'bg-list', 'tasks', 'tasklist', 'team', 'exit', 'quit', 'clear', 'clear-history', 'new', 'incognito',
   'model', 'url', 'name', 'key', 'protocol', 'compact', 'compact-threshold', 'compact-trash',
-  'save', 'load', 'resume', 'rename', 'delete', 'copy', 'image', 'editor', 'add-dir', 'workspace',
+  'save', 'load', 'resume', 'rename', 'delete', 'copy', 'image', 'editor', 'workspace',
   'clear-restore', 'config', 'trash', 'keepalive', 'palette', 'web', 'greeting', 'board', 'keys',
   'btw', 'files', 'status', 'summary', 'statusline', 'mem', 'font', 'check', 'plugins', 'x11',
   'hooks', 'tools', 'errors', 'away', 'temperature', 'imagegen', 'mail', 'effort', 'style', 'me',
   'github', 'voice', 'mcp', 'pexels', 'tvly', 'markdown', 'device', 'update', 'replay', 'plugin',
+  // 连接器总览：GitHub / QQ / MCP / 邮箱 的统一状态入口。
+  // 排在这里而不是紧跟 github，是因为它跨了 github/qq/mcp/mail 四个命令的领域 ——
+  // 放中间会被误读成「GitHub 的子命令」。
+  'connectors',
+  // ── 界面 / 会话体验批（core/commands/cmd-ux.mjs）──────────────────
+  // 【2026-10-20】这 9 个命令此前既不在 catalog、switch 里也没有 case：
+  // 实现存在、对象构造了，但敲下去落到 default 的「未知命令」。
+  // 现在两处都接上了（switch 见 index.mjs 的 uxCommands 段）。
+  'theme', 'tui', 'scroll-speed', 'keybindings', 'version', 'release-notes',
+  'recap', 'focus', 'cd',
+  // ── 诊断 / 统计批（core/commands/cmd-diag.mjs）────────────────────
+  'skill-doctor', 'reload-skills', 'insights', 'import',
+  // ── 多 Agent 操作（core/commands/cmd-agent-ops.mjs）───────────────
+  // switch 里一直有 case，但 catalog 漏登记 → 补全面板和 /palette 里看不见。
+  'fork', 'subtask', 'stop', 'list-agents',
+  // ── 补于 2026-10-20：有 case 但目录漏登记的三个入口 ──────────────
+  // p / palette 共用 case，p 是纯缩写，按别名处理不进目录；
+  // usage 是 cost/stats 归一化后的正式名（见 COMMAND_ALIASES），需进目录；
+  // code-review 是官方正式名（review 是它的别名），同样需进目录。
+  'usage', 'code-review',
 ]
 
 /** 内置命令名集合（O(1) 查询用）。 */
@@ -59,9 +79,13 @@ export const BUILTIN_COMMAND_NAMES = new Set(BUILTIN_COMMANDS)
 export const COMMAND_DESCRIPTIONS = {
   help: '帮助（输 /help 空格看各主题）',
   mcp: 'MCP 服务器：list/status/enable/disable/tools',
+  connectors: '连接器总览：GitHub/QQ/MCP/邮箱 配没配、通没通',
   pexels: '图库搜索 key（FindImage 用）：set/test/clear',
   tvly: 'Tavily 搜索 key（WebSearch 用）：tvly-xxx / clear',
-  cost: 'token 用量与花费',
+  // cost/stats 与 usage 是同一个实现（见 COMMAND_ALIASES 的 cost→usage、stats→usage）。
+  // 三条都保留在目录里，是因为老习惯敲 /cost /stats 的人要能在面板里找到它们；
+  // 描述写明「= /usage」避免误以为三者功能不同。
+  cost: 'token 用量与花费（= /usage）',
   cache: 'Prompt Cache 开关：/cache on|off|retention 24h',
   context: '上下文占用与上限',
   context7: 'Context7 文档查询：空格看子命令',
@@ -70,9 +94,9 @@ export const COMMAND_DESCRIPTIONS = {
   review: '工作区审查',
   trace: '执行轨迹查看/回放',
   workflow: '阶段化工作流说明',
-  stats: '使用统计',
+  stats: '使用统计（= /usage）',
   todos: '待办列表',
-  plan: '计划模式开关',
+  plan: '计划模式：开关 / open 看当前计划 / 带描述直接开工',
   deep: `深模式（maxTurns ${DEEP_MAX_TURNS}）`,
   watch: '持续模式：/watch on|off',
   goal: '完成契约：自动跨轮推进直到达成',
@@ -107,9 +131,9 @@ export const COMMAND_DESCRIPTIONS = {
   copy: '复制最后回复',
   image: '识图：/image <路径> [说明]',
   editor: '长消息编辑：/editor 打开外部编辑器',
-  'add-dir': '加工作目录：/add-dir /路径',
   workspace: '查看/设置工作区：/workspace [路径]',
   'clear-restore': '找回被 /clear 清掉的对话',
+  'clear-history': '清空当前对话但保留会话 ID（可 /clear-restore 恢复）',
   config: '切 Provider：留空进选择列表',
   trash: '文件回收站：无参看列表',
   keepalive: '息屏保活',
@@ -139,7 +163,10 @@ export const COMMAND_DESCRIPTIONS = {
   style: '回复偏好（/style <自由文本>；与 /me 同字段）',
   me: '用户资料（称呼/职业/偏好；偏好与 /style 同字段）',
   github: 'GitHub 工具集（仓库/issue/PR 读写）',
-  tasks: '持久待办（跟轮内 todo 不是一回事）',
+  // /tasks 对齐官方语义（aliases: ["bashes"]）—— 管后台进程；
+  // 持久化任务清单改名 /tasklist（原 /tasks，2026-10-22 让位）。
+  tasks: '后台进程：看/详情/中止（官方语义）',
+  tasklist: '持久任务清单（跟轮内 todo 不是一回事）',
   agents: '子 Agent：谁在跑、卡住了吗',
   team: '多 Agent 协作全景（团队名=任务列表名）',
   mail: '邮箱接码 MCP：空格看子命令',
@@ -154,10 +181,31 @@ export const COMMAND_DESCRIPTIONS = {
   update: '检查更新（镜像下载，不覆盖用户数据）',
   replay: '进会话时是否显示历史正文',
   plugin: 'DSH 插件：装/卸/启停（/plugins 是别名）',
+  // ── 补于 2026-10-20：13 个死命令接线后补登记，外加 4 个一直有 case
+  //    但没进目录的多 Agent 命令（面板里原本看不见）──
+  theme: '渲染配色（转发到 /markdown）',
+  tui: '渲染器说明（全屏固定启用）',
+  'scroll-speed': '滚屏步长：<行数>',
+  keybindings: '快捷键速查（只列真实键位）',
+  version: '版本号（进程内 vs 磁盘，含重启提示）',
+  'release-notes': '近期改动（读 git log）',
+  recap: '回顾当前会话进展',
+  focus: '专注视图：只留提问与回复（隐藏工具行/思考）',
+  cd: '切工作目录（等价 /workspace）',
+  'skill-doctor': '哪些 skill 最占上下文',
+  'reload-skills': '重新扫描磁盘上的 skill',
+  insights: '会话使用统计报告',
+  import: '导入外部配置（MCP/设置）',
+  fork: '派生后台 Agent，继承当前对话',
+  subtask: '派一个子 Agent 去做指定任务',
+  stop: '中止子 Agent',
+  'list-agents': '列出可发消息的对象（peers 是别名）',
+  usage: 'token 用量与会话统计（cost/stats 归一到这里）',
+  'code-review': '工作区代码审查（review 是别名）',
 }
 
 /**
- * 参数格式提示（对齐官方 argumentHint，如官方 /add-dir 是 '<path>'）。
+ * 参数格式提示（对齐官方 argumentHint，如官方 /workspace 是 '[path]'）。
  *
  * 只给真正需要参数的命令写，纯开关类命令留空更干净。
  *
@@ -172,13 +220,17 @@ export const COMMAND_DESCRIPTIONS = {
  * 错提示比没提示更伤。
  */
 export const ARG_HINTS = {
-  'add-dir': '<路径>', workspace: '[路径]', resume: '[ID|名称]', delete: '<ID|all>',
+  workspace: '[路径]', resume: '[ID|名称]', delete: '<ID|all>',
   rename: '<名称>', branch: '<名称>', save: '[名称]', compact: '[N|micro|force|status]',
   'compact-threshold': '[数字|0 0|0 0 N]', model: '[配置ID] <模型名>', url: '[配置ID] <地址>',
   key: '[ID] <sk-...|pool|clear>', name: '[配置ID] <显示名>',
-  config: '[ID|list|provider|…]', effort: '[强度|off|show|hide|replay]', style: '[风格名|off]',
+  // 官方 /config 的 argumentHint 就是 'key=value'。CCM 除 Provider 切换外
+  // 也支持 key=value（受支持的 key 见 cmdConfig 的用法文本），所以 hint 里
+  // 把两种入口都写上，别让用户以为只能切 Provider。
+  config: '[ID|list|provider|…|key=value]', effort: '[强度|off|show|hide|replay]', style: '[风格名|off]',
   me: '[set <字段> <值>|clear <字段>]',
   github: '[login|repo|test|logout]',
+  connectors: '[github|qq|mcp|mail|help]',
   permissions: '[mode|allow|deny <名>]', font: '[reset]',
   statusline: '[show|set <命令>|test|off]',
   trash: '[restore <序号>|clear]',
@@ -193,10 +245,20 @@ export const ARG_HINTS = {
   // 那里一个子命令一行、各带说明。
   goal: '[目标描述|子命令]',
   // 注：slashCommands 里只有 /skills（复数），没有 /skill，别再给 skill 写 hint
-  'bg-status': '<任务ID>', skills: '[技能名]', team: '[名称]', tasks: '[列表名]',
+  'bg-status': '<任务ID>', skills: '[技能名]', team: '[名称]',
+  tasks: '[list|all|<id>|stop <id|名字>]', tasklist: '[列表名|lists|clear]',
   agents: '[cards|reload|new]',
-  help: '[主题]', copy: '', undo: '', rewind: '',
+  help: '[主题]', undo: '', rewind: '',
   device: '[mode 主屏|副屏|选择|shell|vd|test]',
+  // ── 补于 2026-10-20（audit-commands.md §6 ARG_HINTS 缺失清单）──
+  // 每条都对着实现里的 args[0] 分支核过，不写实现不认的子命令。
+  mcp: '[list|status|tools|enable|disable]',
+  context: '[all]',
+  fork: '<指令>', subtask: '<任务>',
+  // 死命令接线后补的 hint。scroll-speed / cd 是真正吃参数的，其余留空。
+  'scroll-speed': '<行数>', cd: '[路径]', theme: '[classic|official]',
+  plan: '[open|<描述>|on|off]', copy: '[N]',
+  'skill-doctor': '[all]',
 }
 
 /**

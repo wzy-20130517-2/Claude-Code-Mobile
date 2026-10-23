@@ -52,27 +52,22 @@ export function makeMiscCommands(ctx) {
           }
           return `自动保活: ${ctx.config.keepaliveAuto !== false ? '开启 ✓（默认）' : '关闭'}\n  /keepalive auto on   每次启动时自动开启静音音频\n  /keepalive auto off  关闭启动自动保活`
         }
-        // /keepalive on  — 开启静音音频保活（息屏不断流，费电）
+        // /keepalive on — 开启 AudioTrack 静音保活（息屏不断流，CPU 约 0%）
         if (args[0] === 'on') {
-          try {
-            execFileSync('bash', [audioScript, 'start'], { timeout: 10000, stdio: 'ignore' })
-            return '静音音频保活已开启 ✓ 息屏时网络不断、CPU 不冻\n用完请 /keepalive off 关闭（省电）'
-          } catch { return '开启失败：检查 termux-api / ffmpeg 是否安装' }
+          const ok = ctx.ensureAudioTrackKeepalive?.()
+          return ok
+            ? '保活已开启 ✓ AudioTrack 静音循环，息屏不断流\nCPU 实测约 0%（替代旧的 MediaPlayer 方案，原为 30%）'
+            : '开启失败：检查 /data/local/tmp/ccm-audio.dex 是否生成（需 javac + d8 + root）'
         }
-        // /keepalive off — 关闭静音音频保活
+        // /keepalive off — 关闭保活
         if (args[0] === 'off') {
-          try {
-            execFileSync('bash', [audioScript, 'stop'], { timeout: 10000, stdio: 'ignore' })
-            return '静音音频保活已关闭（省电）'
-          } catch { return '关闭失败' }
+          try { ctx.releaseAudioTrackKeepalive?.() } catch {}
+          return '保活已关闭（省电）'
         }
         const wake = ctx.acquireMainWakeLock() ? '已持有 ✓' : '失败 ✗'
-        const audio = (() => {
-          try {
-            const out = execFileSync('bash', [audioScript, 'status'], { timeout: 5000, encoding: 'utf-8' })
-            return out.includes('运行中') ? '播放中 ✓（费电）' : '未运行（省电）'
-          } catch { return '未知' }
-        })()
+        const audio = ctx.isAudioTrackKeepaliveRunning?.()
+          ? 'AudioTrack 循环中 ✓（CPU 约 0%）'
+          : '未运行（省电）' 
         const whitelist = ctx.checkBatteryWhitelist()
         const whitelistStr = whitelist === true ? '在白名单 ✓' : whitelist === false ? '不在白名单 ✗' : '无法检测（需 root/Shizuku）'
         return `保活状态:
@@ -197,9 +192,23 @@ export function makeMiscCommands(ctx) {
 
     context(args) {
         // /context            查看当前占用
+        // /context all        同上，并展开明细（对齐官方 2.1.303 的 argumentHint [all]）
         // /context 200k       设置上下文窗口上限（影响状态行百分比与压缩判断）
         // /context reset      恢复默认
+        //
+        // 【[all] 干什么】官方 2.1.303 的 /context 是「Visualize current context
+        // usage as a colored grid」+ argumentHint `[all]`，展开的是**分类明细**
+        // （categories / mcp_tools / memory_files / agents / skills 各自的 token 数）。
+        // CCM 的上下文面板只有总量条，用户想知道「到底是谁占的」时没处看 ——
+        // 尤其是 skill 与 MCP 工具，它们静默吃掉几万 token 却不出现在消息计数里。
+        // 这里给的是同一份数据的本地可得部分（历史消息 / 系统提示词 / 工具定义 /
+        // 上下文文件），拿不到的分类不编造。
         const arg = (args[0] || '').toLowerCase()
+        if (arg === 'all') {
+          return ctx.cmdContextDetail
+            ? ctx.cmdContextDetail(ctx.agent, ctx.getMaxContext())
+            : ctx.cmdContext(ctx.agent, ctx.getMaxContext())
+        }
         if (arg === 'reset') {
           ctx.setMaxContext(1000000)
           ctx.updateFsStatus()

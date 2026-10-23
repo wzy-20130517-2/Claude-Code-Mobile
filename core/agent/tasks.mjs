@@ -85,7 +85,7 @@ export function getTask(listId, id) {
   return readTask(listId, id)
 }
 
-export function createTask(listId, { subject, description = '', activeForm = '', blockedBy = [] } = {}) {
+export function createTask(listId, { subject, description = '', activeForm = '', blockedBy = [], metadata = null } = {}) {
   if (!subject || !String(subject).trim()) throw new Error('subject 必填')
   const id = String(nextId(listId))
   const task = {
@@ -101,6 +101,10 @@ export function createTask(listId, { subject, description = '', activeForm = '',
     // 进展留痕（对齐官方 TaskGet 的 comments）：多 Agent 协作时
     // 交接人需要知道"前面那个人做到哪、卡在什么地方"，光看 status 不够
     comments: [],
+    // metadata（对齐官方 2.1.303 TaskCreate/TaskUpdate）：任意键值，
+    // 给调用方挂「相关文件」「PR 号」「所属批次」这类结构化信息用。
+    // 官方语义是「可任意嵌套的 JSON」，这里原样存不解释。
+    ...(metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? { metadata } : {}),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   }
@@ -162,6 +166,19 @@ export function updateTask(listId, id, patch = {}) {
   }
   for (const k of ['subject', 'description', 'activeForm', 'status', 'owner']) {
     if (k in patch) task[k] = patch[k]
+  }
+  // metadata 是**合并**而不是替换（对齐官方 2.1.303：
+  // "Metadata keys to merge into the task. Set a key to null to delete it."）。
+  // 为什么必须合并：调用方常常只更新一个键（比如把 pr 号补上），
+  // 替换语义会把它之前写的「相关文件」一起抹掉 —— 而且是静默的，
+  // 下次有人 TaskGet 才发现信息没了。
+  if (patch.metadata && typeof patch.metadata === 'object' && !Array.isArray(patch.metadata)) {
+    const merged = { ...(task.metadata && typeof task.metadata === 'object' ? task.metadata : {}) }
+    for (const [k, v] of Object.entries(patch.metadata)) {
+      if (v === null) delete merged[k]      // null = 删掉这个键（官方同款约定）
+      else merged[k] = v
+    }
+    task.metadata = merged
   }
   task.updatedAt = new Date().toISOString()
   return writeTask(listId, task)
