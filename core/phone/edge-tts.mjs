@@ -20,7 +20,8 @@
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { createHash, randomBytes } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
+import { generateSecMsGec } from './edge-gec.mjs'
 import { request as httpsRequest } from 'node:https'
 
 const CLIENT_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4'
@@ -30,23 +31,17 @@ const CHROME_MAJOR = CHROME_VERSION.split('.')[0]
 const WSS_HOST = 'speech.platform.bing.com'
 const WSS_PATH = '/consumer/speech/synthesize/readaloud/edge/v1'
 
-// Sec-MS-GEC：微软的反滥用签名，2024 年起缺了直接 403（实测手写协议不带它必失败）。
-// 算法：当前秒向下取整到 5 分钟 → 加 Unix/FILETIME 纪元差 → 乘 1e7 转 100ns ticks
-//      → SHA256(ticks + clientToken) 大写十六进制。
-// ticks 是 19 位数超出 Number 安全范围，必须用 BigInt。
+// Sec-MS-GEC：微软的反滥用签名。2026-10 起服务端升级到 v2 ——
+// 版本前缀从 `1-` 改成 `2-`，token 也从纯 SHA256 变成 `<16hex>-<64hex>`。
+// 旧的写法现在一律 403（rany2/edge-tts#507）。算法实现在 edge-gec.mjs。
 // 注意它是【URL 查询参数】不是 header —— 放错位置照样 403。
-function edgeGec() {
-  const rounded = Math.floor(Date.now() / 1000 / 300) * 300
-  const ticks = (BigInt(rounded) + 11644473600n) * 10000000n
-  return createHash('sha256').update(ticks.toString() + CLIENT_TOKEN).digest('hex').toUpperCase()
-}
 
 function buildWssPath() {
   const connId = randomBytes(16).toString('hex')
   return `${WSS_PATH}?TrustedClientToken=${CLIENT_TOKEN}`
     + `&ConnectionId=${connId}`
-    + `&Sec-MS-GEC=${edgeGec()}`
-    + `&Sec-MS-GEC-Version=1-${CHROME_VERSION}`
+    + `&Sec-MS-GEC=${generateSecMsGec()}`
+    + `&Sec-MS-GEC-Version=2-${CHROME_VERSION}`
 }
 
 // 常用中文语音。zh-CN-XiaoxiaoNeural 是默认，语气自然适合播报。

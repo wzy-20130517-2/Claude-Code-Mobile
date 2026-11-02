@@ -37,3 +37,12 @@ dsh-host/*.log
 dsh-host/*.pid
 rolemate-mobile.png
 core/tools/vd/build/
+
+# ── 项目根目录的调试截图（2026-11-01 加）──
+# 这些都是开发过程中随手截的页面（登录页/token页/验证码页/UI 对比），
+# 含账号信息和一次性材料，不该进仓库。真正的文档配图放 docs/ 下单独管理。
+/*.png
+/*.jpeg
+/*.jpg
+# 临时探测脚本（TTS 签名调试用，跑完即弃）
+/*-probe*.mjs

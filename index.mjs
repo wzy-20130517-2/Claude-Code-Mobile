@@ -2871,6 +2871,21 @@ async function main() {
     })
   } catch {}
 
+  // 注册表心跳：定时刷新 lastSeen，避免长任务被误判成死会话。
+  //
+  // 只靠「每轮开始时刷一次」不够 —— 单轮跑超过 STALE_MS（10 分钟）的长任务
+  // （画动画、跑全量测试、长链路 agent）中途没有任何新轮次，lastSeen 停在
+  // 轮次开始那一刻；期间别的进程一调 ListSessions 就会把它判死并 rmSync 删掉，
+  // 之后 includeDead 也捞不回来（文件已物理删除）。
+  //
+  // 间隔取 STALE_MS/5：留足 5 次容错，即使某几次写盘失败也不会掉到过期。
+  // unref 让这个定时器不阻止进程退出。
+  const PEER_HEARTBEAT_MS = 2 * 60 * 1000
+  const peerHeartbeatTimer = setInterval(() => {
+    try { peerHeartbeat() } catch {}
+  }, PEER_HEARTBEAT_MS)
+  peerHeartbeatTimer.unref?.()
+
   // ── 跨会话消息轮询（2026-10-20）──
   //
   // 对齐官方 InboxPoller（claude.js:1572100+，1 秒一次）。
