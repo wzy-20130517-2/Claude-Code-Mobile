@@ -114,6 +114,12 @@ jobs:
           cp -r /tmp/ocl-headers/CL "$SYSROOT/usr/include/"
           test -f "$SYSROOT/usr/include/CL/cl.h" && echo "headers OK"
 
+      # 【GGML_BACKEND_DL 必须开】
+      # ggml_backend_init() 这个 dlopen 入口由 GGML_BACKEND_DL_IMPL 宏生成，
+      # 而宏体包在 #ifdef GGML_BACKEND_DL 里。不开这个标志编出来的 .so
+      # 没有任何后端入口，运行时只会报
+      #   "failed to find ggml_backend_init in .../libggml-opencl.so"
+      # 而且它要求 BUILD_SHARED_LIBS=ON，否则 cmake 直接 FATAL_ERROR。
       - name: Configure (NDK cross-compile, OpenCL only)
         run: |
           SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
@@ -143,6 +149,8 @@ jobs:
             -DOpenCL_INCLUDE_DIR=$SYSROOT/usr/include \
             -DOpenCL_LIBRARY="$OCL_LIB" \
             -DGGML_OPENCL=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DBUILD_SHARED_LIBS=ON \
             -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \
             -DGGML_OPENCL_TARGET_VERSION=${{ inputs.opencl_target }} \
             -DGGML_OPENCL_EMBED_KERNELS=ON \
