@@ -90,26 +90,33 @@ jobs:
       # 删掉不影响语义（kernel 里本来就有 #define 兜底）。
       - name: Strip Qualcomm-only extension pragmas from kernels
         run: |
-          set -euo pipefail
           cd llama.cpp/ggml/src/ggml-opencl/kernels
+
           BEFORE=$(grep -rl "cl_qcom" . 2>/dev/null | wc -l)
           echo "含 cl_qcom 的 kernel: $BEFORE 个"
 
-          # 有 6 种：reqd_sub_group_size / extra_vector_types / subgroup_constant_load /
-          # subgroup_shuffle / subgroup_uniform_load …全删。它们是 Adreno 专属提示，
-          # Mali 上无意义；Mali 编译器遇到不认识的 extension 会中止预处理。
-          # 用 grep -lZ + xargs 避免 while-read 在子 shell 里丢变量；
-          # sed 正则用 -E（BRE 的 \+ 在这里不生效，之前就是这么漏掉 4 个的）
-          grep -rlZ "cl_qcom" . 2>/dev/null | xargs -0 -r sed -i -E \
-            '/^[[:space:]]*#pragma[[:space:]]+OPENCL[[:space:]]+EXTENSION[[:space:]]+cl_qcom/d'
+          # 6 种变体（reqd_sub_group_size / extra_vector_types /
+          # subgroup_constant_load / subgroup_shuffle / subgroup_uniform_load …）全删。
+          # 它们是 Adreno 专属提示，Mali 上无意义；而 Mali 编译器遇到不认识的
+          # extension 会中止预处理，导致后面所有 #define 失效。
+          #
+          # 不用 set -euo pipefail / xargs：grep 无匹配时返回 1，
+          # pipefail 会让脚本在中途退出，而 -r 参数又依赖 xargs 的行为。
+          # 这里逐个文件 sed，退出码自己判断，最稳。
+          grep -rl "cl_qcom" . 2>/dev/null | while IFS= read -r f; do
+            sed -i -E '/^[[:space:]]*#pragma[[:space:]]+OPENCL[[:space:]]+EXTENSION[[:space:]]+cl_qcom/d' "$f"
+          done
 
+          PRAGMA=$(grep -rn "pragma.*cl_qcom" . 2>/dev/null | wc -l)
+          echo "残留 pragma: $PRAGMA 个（应为 0）"
 
-          # 剩下的应该是 `#ifdef cl_qcom_*` 条件编译块。
-          # 那些不用删：pragma 一没，宏就不会被定义，整块自然跳过，
-          # ADRENO_GPU 也不会定义 —— 正是我们要的。
-          LEFT=$(grep -rh "cl_qcom" . 2>/dev/null | grep -v "ifdef\|defined\|endif" | wc -l)
-          echo "残留的非条件编译用法: $LEFT 个（应为 0）"
-          test "$LEFT" -eq 0
+          # 剩下的应该只有 #if/#elif defined(...) 这类守卫，它们不含 pragma。
+          # 注意 grep -c 在无匹配时返回 1，用 || true 兜住。
+          LEFT=$(grep -rh "cl_qcom" . 2>/dev/null | grep -v "ifdef\|defined\|endif" | wc -l || true)
+          echo "其他 cl_qcom 用法: $LEFT 行"
+          grep -rn "pragma.*cl_qcom" . 2>/dev/null | head -5 || true
+
+          test "$PRAGMA" -eq 0
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
