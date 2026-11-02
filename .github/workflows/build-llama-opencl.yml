@@ -81,10 +81,22 @@ jobs:
           ndk-version: r29
           add-to-path: false
 
-      # 【OpenCL 的坑】ggml-opencl 的 CMakeLists 第一行是 find_package(OpenCL REQUIRED)，
-      # 交叉编译时它会去找宿主机的 OpenCL，而 ubuntu-latest 上没有 → 直接失败。
-      # NDK 自带 OpenCL 头文件和 libOpenCL.so（stub，运行时由系统提供真身），
-      # 所以用 CMAKE_FIND_ROOT_PATH 把查找限制在 sysroot 里，并显式给路径。
+      # 【OpenCL 的坑，两个】
+      # 1. CMakeLists 第一行是 find_package(OpenCL REQUIRED)，交叉编译时会去找宿主机，
+      #    而 ubuntu-latest 上没有 → 显式指定路径，并把查找限制在 sysroot 内。
+      # 2. NDK **只带 libOpenCL.so，不带头文件**（配置日志里那句
+      #    "Looking for include file OpenCL/cl.h - not found" 就是这个）。
+      #    所以单独拉 Khronos 官方 OpenCL-Headers 放到 sysroot/include 下。
+      - name: Fetch OpenCL headers (NDK ships the lib but not the headers)
+        run: |
+          SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+          git clone --depth 1 https://github.com/KhronosGroup/OpenCL-Headers.git /tmp/ocl-headers
+          # ggml-opencl.cpp 用的是 CL/cl.h（不是 OpenCL/cl.h），所以拷 CL 这一层
+          mkdir -p "$SYSROOT/usr/include"
+          cp -r /tmp/ocl-headers/CL "$SYSROOT/usr/include/"
+          ls "$SYSROOT/usr/include/CL/" | head -5
+          test -f "$SYSROOT/usr/include/CL/cl.h" && echo "CL/cl.h OK"
+
       - name: Configure (NDK cross-compile, OpenCL only)
         run: |
           SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
