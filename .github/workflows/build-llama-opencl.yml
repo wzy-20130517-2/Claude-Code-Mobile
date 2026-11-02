@@ -79,6 +79,28 @@ jobs:
           print('补丁应用成功')
           PY
 
+      # 【Mali 编译器 choke 在 Qualcomm 私有扩展上】
+      # 77 个 kernel 里都有这行：
+      #   #pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
+      # Mali 的编译器遇到不认识的 extension pragma 会**中止预处理**，
+      # 于是文件后面所有 #define（N_SIMDGROUP / N_DST / N_SIMDWIDTH …）全部失效，
+      # 报出一串 "use of undeclared identifier"。
+      #
+      # 这个 pragma 只是给 Adreno 的 sub_group_size 提示，Mali 上没有任何作用，
+      # 删掉不影响语义（kernel 里本来就有 #define 兜底）。
+      - name: Strip Qualcomm-only extension pragmas from kernels
+        run: |
+          cd llama.cpp/ggml/src/ggml-opencl/kernels
+          BEFORE=$(grep -rl "cl_qcom" . 2>/dev/null | wc -l)
+          echo "含 cl_qcom 的 kernel: $BEFORE 个"
+          grep -rl "cl_qcom" . 2>/dev/null | while read -r f; do
+            # 只删这一行的 pragma，其它内容原样保留
+            sed -i '/#pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size/d' "$f"
+          done
+          AFTER=$(grep -rl "cl_qcom" . 2>/dev/null | wc -l)
+          echo "清理后剩余: $AFTER 个"
+          test "$AFTER" -eq 0
+
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         id: ndk
