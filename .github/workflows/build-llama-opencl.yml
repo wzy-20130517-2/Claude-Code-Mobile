@@ -81,21 +81,38 @@ jobs:
           ndk-version: r29
           add-to-path: false
 
-      # 【OpenCL 的坑，两个】
-      # 1. CMakeLists 第一行是 find_package(OpenCL REQUIRED)，交叉编译时会去找宿主机，
-      #    而 ubuntu-latest 上没有 → 显式指定路径，并把查找限制在 sysroot 内。
-      # 2. NDK **只带 libOpenCL.so，不带头文件**（配置日志里那句
-      #    "Looking for include file OpenCL/cl.h - not found" 就是这个）。
-      #    所以单独拉 Khronos 官方 OpenCL-Headers 放到 sysroot/include 下。
-      - name: Fetch OpenCL headers (NDK ships the lib but not the headers)
+      # 【OpenCL 依赖，NDK r29 一个都不给】
+      # 实测 NDK r29 的 sysroot 里只有 libdl/libz/liblog/libGLESv2/libm 这类，
+      # **没有 libOpenCL.so 也没有 CL 头文件**（配置日志里
+      # "Looking for include file OpenCL/cl.h - not found" + 找不到 .so 都是这个）。
+      #
+      # 两条来源都试过、都不该走：
+      #   · 自己写 stub —— 要逐个抄 31 个函数签名，错一个就是运行时崩溃
+      #   · 链 Khronos ICD-Loader —— 那是要编进产物的，不是我们要的
+      #
+      # 正解：**直接下 Termux 的 ocl-icd 包**。它就是 NDK 编的 aarch64 Android 库，
+      # 只依赖 libdl/libc，导出 134 个符号。手机端运行时本来也是它，版本天然一致。
+      - name: Fetch OpenCL lib + headers from the Termux ocl-icd package
         run: |
+          set -euo pipefail
           SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+          DEST=$SYSROOT/usr/lib/aarch64-linux-android
+          mkdir -p "$DEST" "$SYSROOT/usr/include"
+
+          # ubuntu-latest 有 dpkg-deb，直接解包最省事
+          curl -fsSL -o /tmp/ocl.deb \
+            "https://mirrors.bfsu.edu.cn/termux/apt/termux-main/pool/main/o/ocl-icd/ocl-icd_2.3.5_aarch64.deb"
+          dpkg-deb -x /tmp/ocl.deb /tmp/ocl
+
+          # 包里只有 .so（已核实：lib/libOpenCL.so + .so.1，没有头文件）
+          find /tmp/ocl -name 'libOpenCL.so*' | head
+          cp "$(find /tmp/ocl -name 'libOpenCL.so' | head -1)" "$DEST/libOpenCL.so"
+          ls -la "$DEST/libOpenCL.so"
+
+          # 头文件从 Khronos 拉（ggml include 的是 CL/cl.h）
           git clone --depth 1 https://github.com/KhronosGroup/OpenCL-Headers.git /tmp/ocl-headers
-          # ggml-opencl.cpp 用的是 CL/cl.h（不是 OpenCL/cl.h），所以拷 CL 这一层
-          mkdir -p "$SYSROOT/usr/include"
           cp -r /tmp/ocl-headers/CL "$SYSROOT/usr/include/"
-          ls "$SYSROOT/usr/include/CL/" | head -5
-          test -f "$SYSROOT/usr/include/CL/cl.h" && echo "CL/cl.h OK"
+          test -f "$SYSROOT/usr/include/CL/cl.h" && echo "headers OK"
 
       - name: Configure (NDK cross-compile, OpenCL only)
         run: |
