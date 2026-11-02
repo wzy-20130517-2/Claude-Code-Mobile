@@ -21,9 +21,14 @@ on:
       llama_ref:
         description: 'llama.cpp 的 ref（tag / commit / 分支）'
         required: true
-        # b9780 = 本机已装 llama-cpp 0.8.0 对应的版本，
-        # 用它保证 Mali 白名单那段的锚点字符串和本地改过的一致。
-        default: 'b9780'
+        # 【必须和 Termux 装的版本一致】
+        # Termux 的 llama-cpp 0.8.0 来自 tag `v0.8.0`（build.sh 里
+        # TERMUX_PKG_SRCURL 指向 archive/refs/tags/v0.8.0.tar.gz），不是 bXXXX 那种
+        # nightly 编号。版本不一致会撞上两件事：
+        #   · GGML_BACKEND_API_VERSION 对不上 → "incompatible API version
+        #     (backend: 2, current: 3)"，后端直接拒绝初始化
+        #   · Mali 白名单那段的锚点字符串可能已经改过，补丁打不上
+        default: 'v0.8.0'
       opencl_target:
         description: 'OpenCL 目标版本（Mali 报 3.0，填 300）'
         required: true
