@@ -1,0 +1,137 @@
+name: Build llama.cpp OpenCL (Android arm64)
+
+# 目的：给 Termux 编一份认 Mali GPU 的 libggml-opencl.so。
+#
+# 【为什么必须自己编】
+# Termux 官方包 llama-cpp-backend-opencl 是按 Adreno 编的，两处会拒掉 Mali：
+#   1. ggml_opencl_is_device_supported() 的白名单只认 Adreno / Qualcomm / Intel
+#   2. GGML_OPENCL_USE_ADRENO_KERNELS 默认 ON，非 Adreno 直接 return false
+# 两处都在编译期决定，运行时没有开关可以绕过。
+#
+# 【为什么用 NDK 交叉编译】
+# Actions 的 runner 是 x86_64，产物要跑在手机 arm64 上。
+# 用 NDK toolchain 而不是模拟器：不需要 root、不需要 QEMU、几分钟出结果。
+#
+# 【产物怎么给手机】
+# 编完打包成 artifact，手机端 wget 下载后覆盖 $PREFIX/lib/libggml-opencl.so。
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: 'llama.cpp 的 ref（tag / commit / 分支）'
+        required: true
+        # b9780 = 本机已装 llama-cpp 0.8.0 对应的版本，
+        # 用它保证 Mali 白名单那段的锚点字符串和本地改过的一致。
+        default: 'b9780'
+      opencl_target:
+        description: 'OpenCL 目标版本（Mali 报 3.0，填 300）'
+        required: true
+        default: '300'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ inputs.llama_ref }}
+          submodules: recursive
+          path: llama.cpp
+
+      # 白名单补丁：让 Mali 走通用 kernel 路径。
+      # 不选「把 Mali 塞进 ADRENO 分支」是因为那会用上 Adreno 专用 kernel。
+      - name: Patch Mali into the OpenCL allowlist
+        run: |
+          cd llama.cpp
+          python3 - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path('ggml/src/ggml-opencl/ggml-opencl.cpp')
+          src = p.read_text()
+
+          anchor = '''    } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
+              dev_ctx->gpu_family = GPU_FAMILY::INTEL;
+          } else {'''
+          # 实际文件里缩进是 4 空格，不是上面这种，用 split 更稳
+          needle = '    } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {'
+          if needle not in src:
+              sys.exit('找不到 Intel 分支，llama.cpp 改了？')
+
+          # 插在 Intel 分支的 } else { 之前
+          marker = 'dev_ctx->gpu_family = GPU_FAMILY::INTEL;\n    } else {'
+          if marker not in src:
+              sys.exit('Intel 分支结构变了')
+          repl = ('dev_ctx->gpu_family = GPU_FAMILY::INTEL;\n'
+                  '    } else if (strstr(dev_ctx->device_name.c_str(), "Mali")) {\n'
+                  '        // Mali 走通用 kernel：Adreno 专用 kernel 已在编译期关闭。\n'
+                  '        dev_ctx->gpu_family = GPU_FAMILY::UNKNOWN;\n'
+                  '    } else {')
+          p.write_text(src.replace(marker, repl, 1))
+          print('补丁应用成功')
+          PY
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r29
+          add-to-path: false
+
+      # 【OpenCL 的坑】ggml-opencl 的 CMakeLists 第一行是 find_package(OpenCL REQUIRED)，
+      # 交叉编译时它会去找宿主机的 OpenCL，而 ubuntu-latest 上没有 → 直接失败。
+      # NDK 自带 OpenCL 头文件和 libOpenCL.so（stub，运行时由系统提供真身），
+      # 所以用 CMAKE_FIND_ROOT_PATH 把查找限制在 sysroot 里，并显式给路径。
+      - name: Configure (NDK cross-compile, OpenCL only)
+        run: |
+          SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+          cmake -S llama.cpp -B build \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DOpenCL_INCLUDE_DIR=$SYSROOT/usr/include \
+            -DOpenCL_LIBRARY=$SYSROOT/usr/lib/aarch64-linux-android/28/libOpenCL.so \
+            -DGGML_OPENCL=ON \
+            -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \
+            -DGGML_OPENCL_TARGET_VERSION=${{ inputs.opencl_target }} \
+            -DGGML_OPENCL_EMBED_KERNELS=ON \
+            -DGGML_VULKAN=OFF \
+            -DGGML_OPENMP=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DGGML_NATIVE=OFF
+
+      # 只编 OpenCL 后端这一个 target：手机上只要 .so，不要 200MB 的可执行文件。
+      - name: Build libggml-opencl.so
+        run: cmake --build build --target ggml-opencl -j$(nproc)
+
+      - name: Verify the .so
+        run: |
+          SO=$(find build -name 'libggml-opencl.so*' -type f | head -1)
+          echo "产物: $SO"
+          file "$SO"
+          # 必须是 aarch64，不是 x86_64 —— 否则说明 toolchain 没生效
+          file "$SO" | grep -q 'aarch64' || { echo '不是 arm64，toolchain 没生效'; exit 1; }
+          ls -lh "$SO"
+
+      - name: Package
+        run: |
+          mkdir -p out
+          cp $(find build -name 'libggml-opencl.so*' -type f | head -1) out/libggml-opencl.so
+          cd out && sha256sum libggml-opencl.so > SHA256SUMS && cat SHA256SUMS
+          tar czf ../libggml-opencl-android-arm64.tar.gz libggml-opencl.so SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libggml-opencl-android-arm64
+          path: libggml-opencl-android-arm64.tar.gz
+          retention-days: 30
