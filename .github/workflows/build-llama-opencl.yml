@@ -100,6 +100,21 @@ jobs:
       - name: Configure (NDK cross-compile, OpenCL only)
         run: |
           SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+
+          # 【路径探测】NDK 的 OpenCL 是 stub 库，位置随版本变化：
+          #   老版本在 usr/lib/aarch64-linux-android/<API>/libOpenCL.so
+          #   新版本在 usr/lib/aarch64-linux-android/libOpenCL.so
+          # 之前硬编码第一种，cmake 照单全收（它不校验文件是否存在），
+          # 到 make 阶段才报 "No rule to make target ... libOpenCL.so"。
+          OCL_LIB=$(find "$SYSROOT/usr/lib/aarch64-linux-android" -name 'libOpenCL.so' 2>/dev/null | head -1)
+          if [ -z "$OCL_LIB" ]; then
+            echo "找不到 libOpenCL.so，列出候选目录："
+            find "$SYSROOT/usr/lib/aarch64-linux-android" -maxdepth 2 -name 'lib*.so' 2>/dev/null | head -20
+            exit 1
+          fi
+          echo "OpenCL 库: $OCL_LIB"
+          ls -la "$OCL_LIB"
+
           cmake -S llama.cpp -B build \
             -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
@@ -109,7 +124,7 @@ jobs:
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
             -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
             -DOpenCL_INCLUDE_DIR=$SYSROOT/usr/include \
-            -DOpenCL_LIBRARY=$SYSROOT/usr/lib/aarch64-linux-android/28/libOpenCL.so \
+            -DOpenCL_LIBRARY="$OCL_LIB" \
             -DGGML_OPENCL=ON \
             -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \
             -DGGML_OPENCL_TARGET_VERSION=${{ inputs.opencl_target }} \
