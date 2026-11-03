@@ -56,6 +56,32 @@ jobs:
       # 【坑】mnncli 的 CMakeLists 默认会去找 OpenCV，找不到直接报错。
       # 我们只要文本推理，不要图像能力，所以关掉它。
       # 同理关掉 OpenCL 以外的加速后端，避免引入无关依赖。
+      # 【mnncli 要求先有 MNN 静态库】
+      # apps/mnncli/CMakeLists.txt 里写死：
+      #   set(MNN_BUILD_DIR ".../../../build_mnn_static")
+      #   find_library(MNN_LIBRARY NAMES libMNN.a MNN PATHS ${MNN_BUILD_DIR} NO_DEFAULT_PATH REQUIRED)
+      # 所以必须先在仓库根编出 build_mnn_static/libMNN.a，否则 Configure 直接失败。
+      # 官方 android_build.sh 里没有这一步（它假定你手动编过）。
+      - name: Build MNN static library first
+        run: |
+          cd MNN
+          cmake -S . -B build_mnn_static \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ inputs.arch }} \
+            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMNN_BUILD_SHARED_LIBS=OFF \
+            -DMNN_OPENCL=ON \
+            -DMNN_VULKAN=OFF \
+            -DMNN_USE_SSE=OFF \
+            -DMNN_BUILD_OPENCV=OFF \
+            -DMNN_LOW_MEMORY=ON \
+            -DMNN_SUPPORT_TRANSFORMER_FUSE=ON \
+            -DMNN_KLEIDIAI=ON
+          cmake --build build_mnn_static --target MNN -j$(nproc)
+          ls -lh build_mnn_static/libMNN.a
+
       - name: Configure
         run: |
           cd MNN/apps/mnncli
