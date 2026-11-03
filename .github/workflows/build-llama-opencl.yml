@@ -141,8 +141,21 @@ jobs:
             sed -i -E 's/#elif defined *\(ADRENO_GPU\)/#elif defined(ADRENO_GPU) || defined(MALI_GPU)/g' "$f"
           done
 
+          # 4) REQD_SUBGROUP_SIZE_* 是 Adreno 的 __attribute__((qcom_...))，
+          #    定义在已失效的 #elif defined(cl_qcom_...) 块里。Mali 不需要这个
+          #    attribute（宽度本来就是 16，由 N_SIMDWIDTH 控制），全部定义成空。
+          #    判断用「第 1 行是不是 MALI 标记」，不能判 "有没有 REQD_SUBGROUP_SIZE_64"：
+          #    文件里本来就有这个 #define，只不过藏在永远不会进入的
+          #    #elif defined(cl_qcom_...) 分支里。
+          #
+          #    用宏包一层 #ifndef，避免和 Intel 分支的已有定义冲突。
+          grep -rl "REQD_SUBGROUP_SIZE" . 2>/dev/null | while IFS= read -r f; do
+            head -1 "$f" | grep -q "MALI_GPU" && continue
+            sed -i '1i #define MALI_GPU 1\n#ifndef REQD_SUBGROUP_SIZE_16\n#define REQD_SUBGROUP_SIZE_16\n#endif\n#ifndef REQD_SUBGROUP_SIZE_32\n#define REQD_SUBGROUP_SIZE_32\n#endif\n#ifndef REQD_SUBGROUP_SIZE_64\n#define REQD_SUBGROUP_SIZE_64\n#endif\n#ifndef REQD_SUBGROUP_SIZE_128\n#define REQD_SUBGROUP_SIZE_128\n#endif' "$f"
+          done
+
           # 2) 在每个文件最前面定义 MALI_GPU（只加一次）
-          grep -rl "MALI_GPU" . 2>/dev/null | while IFS= read -r f; do
+          grep -rl "REQD_SUBGROUP_SIZE\|defined *(ADRENO_GPU)" . 2>/dev/null | while IFS= read -r f; do
             grep -q "^#define MALI_GPU" "$f" && continue
             sed -i '1i #define MALI_GPU 1' "$f"
           done
@@ -151,6 +164,7 @@ jobs:
           grep -rl "N_SIMDWIDTH 64" . 2>/dev/null | while IFS= read -r f; do
             sed -i -E 's/#define N_SIMDWIDTH 64(.*)$/#define N_SIMDWIDTH 16\1/' "$f"
           done
+
 
           echo "打补丁的文件数: $(grep -rl "MALI_GPU" . 2>/dev/null | wc -l)"
           echo "仍有 N_SIMDWIDTH 64 的: $(grep -rl "N_SIMDWIDTH 64" . 2>/dev/null | wc -l)（应为 0）"
