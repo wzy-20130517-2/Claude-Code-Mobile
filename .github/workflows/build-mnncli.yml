@@ -118,6 +118,16 @@ jobs:
           python3 /tmp/alias.py
           grep -n "using SSLClient" MNN/transformers/llm/engine/src/httplib.h | head -2
 
+      # 【find_package(OpenSSL REQUIRED) 是无条件的】
+      # mnncli 的 CMakeLists 只对 APPLE 做了特判，其他平台一律 REQUIRED。
+      # 我们已经关掉 TLS，但配置阶段仍要满足它。
+      # NDK 里有 libcrypto/libssl 的 stub 库，只缺一个 include 目录 ——
+      # 建个空的即可，因为 CPPHTTPLIB_OPENSSL_SUPPORT 已关，不会有代码真去 include。
+      - name: Satisfy the unconditional OpenSSL lookup
+        run: |
+          mkdir -p ${{ github.workspace }}/ossl-stub/include
+          echo "空 include 目录已建（TLS 已关闭，不会有代码 include 它）"
+
       - name: Configure
         run: |
           cd MNN/apps/mnncli
@@ -155,6 +165,10 @@ jobs:
             -DMNN_LIBRARY=${{ github.workspace }}/MNN/build_mnn_static/libMNN.a \
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
             -DCMAKE_CXX_FLAGS="-DCPPHTTPLIB_ZLIB_SUPPORT" \
+            -DOPENSSL_ROOT_DIR=${{ github.workspace }}/ossl-stub \
+            -DOPENSSL_INCLUDE_DIR=${{ github.workspace }}/ossl-stub/include \
+            -DOPENSSL_SSL_LIBRARY=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libssl.so \
+            -DOPENSSL_CRYPTO_LIBRARY=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libcrypto.so \
 
       - name: Build
         run: |
