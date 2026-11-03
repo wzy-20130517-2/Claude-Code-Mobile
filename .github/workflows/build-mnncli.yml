@@ -96,45 +96,31 @@ jobs:
       # NDK sysroot 有 libcrypto/libssl 的 stub，但没有 openssl/*.h。
       # 用 tarball 而不是 git clone：clone 整个 OpenSSL 仓库在这台 runner 上
       # 要几分钟且经常超时，只要 include/openssl 那几十个头文件。
+      # 【用 OpenSSL 1.1.1 的头，不用 3.x】
+      # 3.x 源码树里是 err.h.in（configure 产物），直接拷过去没有 err.h，
+      # 而 NDK 的 libcrypto/libssl stub 又是按 3.0 编的 —— 但 httplib 只用
+      # SSLClient 的建立/读写/关闭这一小撮 API，1.1.1 和 3.0 在源码层兼容，
+      # 链接时符号也能对上（SSL_CTX_new / SSL_new / SSL_read 等都没改名）。
       - name: Provide OpenSSL headers
         run: |
           SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
           curl -fsSL -o /tmp/openssl.tar.gz \
-            https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz
+            https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1w/openssl-1.1.1w.tar.gz
           tar xzf /tmp/openssl.tar.gz -C /tmp
-          ls /tmp | head
-          SRC=$(find /tmp -maxdepth 1 -name 'openssl-*' -type d | head -1)
+          SRC=$(find /tmp -maxdepth 1 -name 'openssl-1.1.1*' -type d | head -1)
           echo "解压目录: $SRC"
-          test -d "$SRC/include/openssl" || { echo "找不到 include/openssl"; find /tmp -maxdepth 3 -name 'err.h' 2>/dev/null | head; exit 1; }
+          test -f "$SRC/include/openssl/err.h" || { echo "没有 err.h"; exit 1; }
           mkdir -p "$SYSROOT/usr/include"
           cp -r "$SRC/include/openssl" "$SYSROOT/usr/include/"
           echo "拷贝后: $(ls "$SYSROOT/usr/include/openssl/" | wc -l) 个文件"
-          # opensslconf.h / configuration.h 是 configure 产物，源码树里没有。
-          # 用一个最小可用的替代：httplib 只用到少量符号，不需要真实配置值。
-          if [ ! -f "$SYSROOT/usr/include/openssl/opensslconf.h" ]; then
-            cat > "$SYSROOT/usr/include/openssl/opensslconf.h" <<'EOF_CONF'
-          /* 最小占位：httplib 编译期只需要这些开关存在 */
-          #ifndef OPENSSL_CONF_H
-          #define OPENSSL_CONF_H
-          #define OPENSSL_API_COMPAT 0x10100000L
-          #define OPENSSL_NO_DEPRECATED 1
-          #endif
-          EOF_CONF
-          fi
           test -f "$SYSROOT/usr/include/openssl/err.h" && echo "err.h OK"
-          test -f "$SYSROOT/usr/include/openssl/opensslconf.h" && echo "opensslconf.h OK"
 
-      # 【CMAKE_CXX_FLAGS 传不到子 target】
-      # MNN 的 CMake 结构里，httplib 是在 transformers/llm/engine 子项目里被包含的，
-      # 而那边会用自己的 flags 覆盖，-I 加不进去。
-      # 最省事：直接把 openssl 头拷到 httplib.h 所在目录旁边，
-      # 这样 `#include <openssl/err.h>` 会以该目录为基准解析到。
       - name: Mirror OpenSSL headers next to httplib
         run: |
           SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
           cp -r "$SYSROOT/usr/include/openssl" MNN/transformers/llm/engine/src/
           ls MNN/transformers/llm/engine/src/openssl/ | head -3
-          test -f MNN/transformers/llm/engine/src/openssl/err.h && echo "err.h 就位"
+          ls MNN/transformers/llm/engine/src/openssl/err.h >/dev/null && echo "err.h 就位"
 
       - name: Configure
         run: |
