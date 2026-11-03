@@ -112,17 +112,10 @@ jobs:
       # 真要下载时会连不上 https，但那是我们不需要的路径。
       - name: Alias httplib::SSLClient to Client
         run: |
-          # 把 SSLClient 定义成 Client 的别名，让引用它的下载代码能编过。
-          # 用 base64 内联 python，避免在 YAML/shell/python 三层里转义花括号。
-          echo 'aW1wb3J0IHBhdGhsaWIsIHN5cwpwID0gcGF0aGxpYi5QYXRoKCdNTk4vdHJhbnNmb3JtZXJzL2xsbS9lbmdpbmUvc3JjL2h0dHBsaWIuaCcpCnMgPSBwLnJlYWRfdGV4dCgpCmlmICd1c2luZyBTU0xDbGllbnQgPSBDbGllbnQ7JyBpbiBzOgogICAgcHJpbnQoJ+WIq+WQjeW3suWtmOWcqCcpCiAgICByYWlzZSBTeXN0ZW1FeGl0CmlkeCA9IHMucmZpbmQoJ30gLy8gbmFtZXNwYWNlIGh0dHBsaWInKQppZiBpZHggPCAwOgogICAgaWR4ID0gcy5yZmluZCgnfSAgLy8gbmFtZXNwYWNlIGh0dHBsaWInKQppZiBpZHggPCAwOgogICAgaWR4ID0gbGVuKHMpCmFsaWFzID0gKAogICAgJ1xuI2lmbmRlZiBDUFBIVFRQTElCX09QRU5TU0xfU1VQUE9SVCdcCiAgICAnXG4vLyDml6AgVExTIOaehOW7uu+8muaKiiBTU0xDbGllbnQg5b2T5L2c5pmu6YCaIENsaWVudO+8jCcKICAgICfov5nmoLflvJXnlKjlr7nnmoTkuIvovb3ku6PnoIHog73pgJrov4fntJbor5HjgIJcbicKICAgICd1c2luZyBTU0xDbGllbnQgPSBDbGllbnQ7XG4nCiAgICAnI2VuZGlmXG5cbicKKQpwLndyaXRlX3RleHQoc1s6aWR4XSArIGFsaWFzICsgc1tpZHg6XSkKcHJpbnQoJ+W3suaPkuWFpSBTTENsaWVudCDliKvlkI0nKQo=' | base64 -d > /tmp/alias.py
+          echo 'aW1wb3J0IHBhdGhsaWIKcCA9IHBhdGhsaWIuUGF0aCgnTU5OL3RyYW5zZm9ybWVycy9sbG0vZW5naW5lL3NyYy9odHRwbGliLmgnKQpzID0gcC5yZWFkX3RleHQoKQppZiAndXNpbmcgU1NMQ2xpZW50ID0gQ2xpZW50OycgaW4gczoKICAgIHByaW50KCfliKvlkI3lt7LlrZjlnKgnKQogICAgcmFpc2UgU3lzdGVtRXhpdAppZHggPSBzLnJmaW5kKCd9IC8vIG5hbWVzcGFjZSBodHRwbGliJykKaWYgaWR4IDwgMDoKICAgIGlkeCA9IHMucmZpbmQoJ30gIC8vIG5hbWVzcGFjZSBodHRwbGliJykKaWYgaWR4IDwgMDoKICAgIGlkeCA9IGxlbihzKQoKIyBUTFMg5YWz6Zet5pe277yM5LiL6L295Luj56CB5LuN5Lya6LCD55So6L+Z5Yeg5LiqIFNTTCDkuJPlsZ7mlrnms5XjgIIKIyDnu5kgQ2xpZW50IOihpeaIkCBuby1vcO+8jOiuqeS7o+eggee8lui/h++8iOi/kOihjOaXtuS4jeS8muecn+eahOi1sCBUTFMg6Lev5b6E77yJ44CCCmFsaWFzID0gKAogICAgJ1xuI2lmbmRlZiBDUFBIVFRQTElCX09QRU5TU0xfU1VQUE9SVFxuJwogICAgJy8vIOaXoCBUTFMg5p6E5bu655qE5YW85a655bGC77ya5oqKIFNTTENsaWVudCDlvZPkvZzmma7pgJogQ2xpZW5077yMXG4nCiAgICAnLy8g5bm26KGl5LiK5LiL6L295Luj56CB5byV55So55qE5Lik5LiqIFNTTCDkuJPlsZ7mlrnms5XvvIhuby1vcO+8ieOAglxuJwogICAgJ2NsYXNzIENsaWVudDtcbicKICAgICd1c2luZyBTU0xDbGllbnQgPSBDbGllbnQ7XG4nCiAgICAnI2VuZGlmXG5cbicKKQpzID0gc1s6aWR4XSArIGFsaWFzICsgc1tpZHg6XQoKIyDlnKggQ2xpZW50IOexu+mHjOihpeS4pOS4quaWueazle+8muaJviAiYm9vbCBzZXRfZm9sbG93X2xvY2F0aW9uIiDkuYvnsbvnmoTkvY3nva7mj5LlhaUKbWFya2VyID0gJyAgYm9vbCBzZXRfZm9sbG93X2xvY2F0aW9uKGJvb2wgb24pOycKaWYgbWFya2VyIGluIHMgYW5kICdlbmFibGVfc2VydmVyX2NlcnRpZmljYXRlX3ZlcmlmaWNhdGlvbicgbm90IGluIHM6CiAgICBhZGQgPSAobWFya2VyICsgJ1xuJwogICAgICAgICAgICcjaWZuZGVmIENQUEhUVFBMSUJfT1BFTlNTTF9TVVBQT1JUXG4nCiAgICAgICAgICAgJyAgLy8g5pegIFRMUyDmnoTlu7rvvJrov5nkupvmmK/mnIkgU1NMIOaXtuaJjeacieeahOaOpeWPo++8jOi/memHjOWBmuaIkCBuby1vcFxuJwogICAgICAgICAgICcgIGJvb2wgZW5hYmxlX3NlcnZlcl9jZXJ0aWZpY2F0ZV92ZXJpZmljYXRpb24oYm9vbCkgeyByZXR1cm4gdHJ1ZTsgfVxuJwogICAgICAgICAgICcgIGxvbmcgZ2V0X29wZW5zc2xfdmVyaWZ5X3Jlc3VsdCgpIGNvbnN0IHsgcmV0dXJuIDA7IH1cbicKICAgICAgICAgICAnI2VuZGlmJykKICAgIHMgPSBzLnJlcGxhY2UobWFya2VyLCBhZGQsIDEpCiAgICBwcmludCgn5bey6KGlIFNTTCDlhbzlrrnmlrnms5UnKQplbHNlOgogICAgcHJpbnQoJ+acquaJvuWIsOaPkuWFpeeCue+8jOaIluaWueazleW3suWtmOWcqCcpCgpwLndyaXRlX3RleHQocykKcHJpbnQoJ2RvbmUnKQo=' | base64 -d > /tmp/alias.py
           python3 /tmp/alias.py
-          grep -n "using SSLClient" MNN/transformers/llm/engine/src/httplib.h | head -2
+          grep -n "using SSLClient\|enable_server_certificate_verification" MNN/transformers/llm/engine/src/httplib.h | head -3
 
-      # 【find_package(OpenSSL REQUIRED) 是无条件的】
-      # mnncli 的 CMakeLists 只对 APPLE 做了特判，其他平台一律 REQUIRED。
-      # 我们已经关掉 TLS，但配置阶段仍要满足它。
-      # NDK 里有 libcrypto/libssl 的 stub 库，只缺一个 include 目录 ——
-      # 建个空的即可，因为 CPPHTTPLIB_OPENSSL_SUPPORT 已关，不会有代码真去 include。
       - name: Satisfy the unconditional OpenSSL lookup
         run: |
           mkdir -p ${{ github.workspace }}/ossl-stub/include
