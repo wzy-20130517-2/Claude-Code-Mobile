@@ -91,6 +91,22 @@ jobs:
       - name: Configure
         run: |
           cd MNN/apps/mnncli
+          # 【上游 bug】CMakeLists 在 Android 下无条件 append
+          # src/AndroidVideoDecoder.cpp，但 3.6.2 的源码树里没有这个文件，
+          # add_executable 直接报 "Cannot find source file"。
+          # 那是视频解码用的，文本推理用不到 —— 给它个空壳占位即可。
+          #
+          # 手写占位文件是空壳，所以还要保证它不被当成真正的解码器实现：
+          # 补一个空的 .cpp，编译出来就是 no-op，链接阶段如果有引用会报
+          # undefined symbol，那时再补实现。
+          if [ ! -f src/AndroidVideoDecoder.cpp ]; then
+            cat > src/AndroidVideoDecoder.cpp <<'EOF_AVD'
+          // 占位：上游 CMakeLists 在 Android 下无条件引用本文件，但源码树里没有。
+          // 文本推理路径不使用视频解码，保留空翻译单元即可。
+          EOF_AVD
+            echo "已补 AndroidVideoDecoder.cpp 占位（$(wc -l < src/AndroidVideoDecoder.cpp) 行）"
+          fi
+
           cmake -S . -B build_android \
             -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=${{ inputs.arch }} \
