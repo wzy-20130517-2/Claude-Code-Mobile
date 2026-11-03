@@ -88,6 +88,28 @@ jobs:
           cmake --build build_mnn_static --target MNN -j$(nproc)
           ls -lh build_mnn_static/libMNN.a
 
+      # 【OpenSSL 头文件，NDK 只给库不给头】
+      # NDK 的 sysroot 里有 libcrypto.so / libssl.so（stub），但没有 openssl/*.h。
+      # mnncli 的 httplib 开了 CPPHTTPLIB_OPENSSL_SUPPORT 后会 #include 这些头，
+      # 所以从 OpenSSL 官方仓库取一份对应版本的头文件体系。
+      - name: Provide OpenSSL headers
+        run: |
+          SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+          git clone --depth 1 --branch openssl-3.0.15 \
+            https://github.com/openssl/openssl.git /tmp/openssl || \
+          git clone --depth 1 https://github.com/openssl/openssl.git /tmp/openssl
+          # 只需要 include/openssl 下的公共头
+          cp -r /tmp/openssl/include/openssl "$SYSROOT/usr/include/"
+          # 有生成头（configuration 产物），用现成的兜底
+          for h in configuration.h opensslconf.h; do
+            if [ ! -f "$SYSROOT/usr/include/openssl/$h" ]; then
+              found=$(find /tmp/openssl -name "$h" 2>/dev/null | head -1)
+              [ -n "$found" ] && cp "$found" "$SYSROOT/usr/include/openssl/"
+            fi
+          done
+          ls "$SYSROOT/usr/include/openssl/" | head -5
+          test -f "$SYSROOT/usr/include/openssl/err.h" && echo "err.h OK"
+
       - name: Configure
         run: |
           cd MNN/apps/mnncli
