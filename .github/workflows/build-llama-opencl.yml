@@ -118,6 +118,44 @@ jobs:
 
           test "$PRAGMA" -eq 0
 
+      # 【Mali 拿不到 N_DST / N_SIMDWIDTH】
+      # kernel 里的宏块只覆盖两家：
+      #   #ifdef INTEL_GPU            → N_DST 4 / N_SIMDWIDTH 16
+      #   #elif defined(ADRENO_GPU)   → N_DST 4 / N_SIMDWIDTH 64
+      #   #endif                      ← Mali 两个都不满足，宏全空，
+      #                                 后面用到的地方一律 "undeclared identifier"
+      #
+      # 做法：让 Mali 走上 ADRENO 分支（N_DST 各 kernel 取值不同，复用它的最省事），
+      # 但把 N_SIMDWIDTH 从 64 改成 16 —— 实测这台 Mali-G615 的
+      # CL_DEVICE_PREFERRED_VECTOR_WIDTH / subgroup 宽度就是 16（clinfo 的
+      # "Preferred work group size multiple = 16"），不是 Adreno 的 64。
+      #
+      # 先在前面的 strip 步骤里已经删掉了 cl_qcom 的 pragma，所以这里
+      # ADRENO_GPU 本来是不会被定义的，需要显式定义它。
+      - name: Teach the kernels about Mali
+        run: |
+          cd llama.cpp/ggml/src/ggml-opencl/kernels
+
+          # 1) 让 #elif defined(ADRENO_GPU) 也接受 MALI_GPU
+          grep -rl "defined *(ADRENO_GPU)" . 2>/dev/null | while IFS= read -r f; do
+            sed -i -E 's/#elif defined *\(ADRENO_GPU\)/#elif defined(ADRENO_GPU) || defined(MALI_GPU)/g' "$f"
+          done
+
+          # 2) 在每个文件最前面定义 MALI_GPU（只加一次）
+          grep -rl "MALI_GPU" . 2>/dev/null | while IFS= read -r f; do
+            grep -q "^#define MALI_GPU" "$f" && continue
+            sed -i '1i #define MALI_GPU 1' "$f"
+          done
+
+          # 3) Mali 的 subgroup 宽度是 16，不是 Adreno 的 64
+          grep -rl "N_SIMDWIDTH 64" . 2>/dev/null | while IFS= read -r f; do
+            sed -i -E 's/#define N_SIMDWIDTH 64(.*)$/#define N_SIMDWIDTH 16\1/' "$f"
+          done
+
+          echo "打补丁的文件数: $(grep -rl "MALI_GPU" . 2>/dev/null | wc -l)"
+          echo "仍有 N_SIMDWIDTH 64 的: $(grep -rl "N_SIMDWIDTH 64" . 2>/dev/null | wc -l)（应为 0）"
+          grep -rn "N_SIMDWIDTH 16" . 2>/dev/null | head -3 || true
+
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         id: ndk
