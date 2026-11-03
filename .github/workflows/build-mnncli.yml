@@ -127,7 +127,8 @@ jobs:
             -DMNN_BUILD_DIR=${{ github.workspace }}/MNN/build_mnn_static \
             -DMNN_SOURCE_DIR=${{ github.workspace }}/MNN \
             -DMNN_LIBRARY=${{ github.workspace }}/MNN/build_mnn_static/libMNN.a \
-            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
+            -DCMAKE_CXX_FLAGS="-DCPPHTTPLIB_OPENSSL_SUPPORT -DCPPHTTPLIB_ZLIB_SUPPORT"
 
       - name: Build
         run: |
