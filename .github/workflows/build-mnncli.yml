@@ -166,7 +166,9 @@ jobs:
       - name: Build
         run: |
           cd MNN/apps/mnncli
-          cmake --build build_android -j$(nproc)
+          # 只编 mnncli 这个 target。libyuv 自带的 convert/compare 示例会链接失败
+          # （交叉编译下 SIMD 检测漏了 NEON 符号），而 CLI 用不到它们。
+          cmake --build build_android --target mnncli -j$(nproc)
 
       - name: Collect artifacts
         run: |
