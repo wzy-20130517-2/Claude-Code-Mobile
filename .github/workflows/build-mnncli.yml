@@ -101,50 +101,22 @@ jobs:
       # 而 NDK 的 libcrypto/libssl stub 又是按 3.0 编的 —— 但 httplib 只用
       # SSLClient 的建立/读写/关闭这一小撮 API，1.1.1 和 3.0 在源码层兼容，
       # 链接时符号也能对上（SSL_CTX_new / SSL_new / SSL_read 等都没改名）。
-      - name: Provide OpenSSL headers
+      # 【干脆不用 TLS】
+      # 走 OpenSSL 头文件这条路代价太大：3.x 的 err.h 是 configure 产物，
+      # 1.1.1 的 opensslconf.h 也是模板，手写又缺 BN_ULONG 这类内部类型。
+      # 而 mnncli 只在「从 HuggingFace 下载模型」时用 SSLClient —— 我们
+      # 模型在本地，下载功能用不上。
+      #
+      # 所以：关掉 CPPHTTPLIB_OPENSSL_SUPPORT，并给 httplib 补一个
+      # SSLClient = Client 的别名，让 model_downloader 那几处能编过。
+      # 真要下载时会连不上 https，但那是我们不需要的路径。
+      - name: Alias httplib::SSLClient to Client
         run: |
-          SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
-          curl -fsSL -o /tmp/openssl.tar.gz \
-            https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1w/openssl-1.1.1w.tar.gz
-          tar xzf /tmp/openssl.tar.gz -C /tmp
-          SRC=$(find /tmp -maxdepth 1 -name 'openssl-1.1.1*' -type d | head -1)
-          echo "解压目录: $SRC"
-          test -f "$SRC/include/openssl/err.h" || { echo "没有 err.h"; exit 1; }
-          mkdir -p "$SYSROOT/usr/include"
-          cp -r "$SRC/include/openssl" "$SYSROOT/usr/include/"
-          echo "拷贝后: $(ls "$SYSROOT/usr/include/openssl/" | wc -l) 个文件"
-          test -f "$SYSROOT/usr/include/openssl/err.h" && echo "err.h OK"
-
-          # opensslconf.h 是 configure 产物（源码树里只有 .in 模板，内容是 Perl），
-          # 1.1.1 里它主要是平台开关。手写一份 Android/aarch64 的最小配置：
-          # httplib 只用 SSL_CTX/SSL/SSL_read/SSL_write 这层 API，不涉及
-          # 引擎、FIPS、旧算法，所以只需要一句话的 64 位小端配置。
-          cat > "$SYSROOT/usr/include/openssl/opensslconf.h" <<'EOF_CONF'
-          /* 手写最小配置：Android aarch64，OpenSSL 1.1.1 头 + NDK 的 3.0 stub 库 */
-          #ifndef OPENSSL_CONFIGURED_API
-          # define OPENSSL_CONFIGURED_API 30000
-          #endif
-          #ifndef OPENSSL_SYS_ANDROID
-          # define OPENSSL_SYS_ANDROID 1
-          #endif
-          #ifndef OPENSSL_NO_STDIO
-          # define OPENSSL_NO_STDIO 1
-          #endif
-          /* 明确关掉我们不需要的子系统，减少头文件里的依赖 */
-          # ifndef OPENSSL_NO_DEPRECATED
-          #  define OPENSSL_NO_DEPRECATED
-          # endif
-          EOF_CONF
-          echo "opensslconf.h 已写"
-          # 镜像目录里也放一份，e_os2.h 会从那里找
-          cp "$SYSROOT/usr/include/openssl/opensslconf.h" "$SRC/include/openssl/" 2>/dev/null || true
-
-      - name: Mirror OpenSSL headers next to httplib
-        run: |
-          SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
-          cp -r "$SYSROOT/usr/include/openssl" MNN/transformers/llm/engine/src/
-          ls MNN/transformers/llm/engine/src/openssl/ | head -3
-          ls MNN/transformers/llm/engine/src/openssl/err.h >/dev/null && echo "err.h 就位"
+          # 把 SSLClient 定义成 Client 的别名，让引用它的下载代码能编过。
+          # 用 base64 内联 python，避免在 YAML/shell/python 三层里转义花括号。
+          echo 'aW1wb3J0IHBhdGhsaWIsIHN5cwpwID0gcGF0aGxpYi5QYXRoKCdNTk4vdHJhbnNmb3JtZXJzL2xsbS9lbmdpbmUvc3JjL2h0dHBsaWIuaCcpCnMgPSBwLnJlYWRfdGV4dCgpCmlmICd1c2luZyBTU0xDbGllbnQgPSBDbGllbnQ7JyBpbiBzOgogICAgcHJpbnQoJ+WIq+WQjeW3suWtmOWcqCcpCiAgICByYWlzZSBTeXN0ZW1FeGl0CmlkeCA9IHMucmZpbmQoJ30gLy8gbmFtZXNwYWNlIGh0dHBsaWInKQppZiBpZHggPCAwOgogICAgaWR4ID0gcy5yZmluZCgnfSAgLy8gbmFtZXNwYWNlIGh0dHBsaWInKQppZiBpZHggPCAwOgogICAgaWR4ID0gbGVuKHMpCmFsaWFzID0gKAogICAgJ1xuI2lmbmRlZiBDUFBIVFRQTElCX09QRU5TU0xfU1VQUE9SVCdcCiAgICAnXG4vLyDml6AgVExTIOaehOW7uu+8muaKiiBTU0xDbGllbnQg5b2T5L2c5pmu6YCaIENsaWVudO+8jCcKICAgICfov5nmoLflvJXnlKjlr7nnmoTkuIvovb3ku6PnoIHog73pgJrov4fntJbor5HjgIJcbicKICAgICd1c2luZyBTU0xDbGllbnQgPSBDbGllbnQ7XG4nCiAgICAnI2VuZGlmXG5cbicKKQpwLndyaXRlX3RleHQoc1s6aWR4XSArIGFsaWFzICsgc1tpZHg6XSkKcHJpbnQoJ+W3suaPkuWFpSBTTENsaWVudCDliKvlkI0nKQo=' | base64 -d > /tmp/alias.py
+          python3 /tmp/alias.py
+          grep -n "using SSLClient" MNN/transformers/llm/engine/src/httplib.h | head -2
 
       - name: Configure
         run: |
@@ -178,16 +150,11 @@ jobs:
             -DMNN_BUILD_OPENCV=OFF \
             -DMNN_LOW_MEMORY=ON \
             -DMNN_SUPPORT_TRANSFORMER_FUSE=ON \
-            -DOPENSSL_ROOT_DIR=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr \
-            -DOPENSSL_INCLUDE_DIR=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include \
-            -DOPENSSL_CRYPTO_LIBRARY=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libcrypto.so \
-            -DOPENSSL_SSL_LIBRARY=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libssl.so \
             -DMNN_BUILD_DIR=${{ github.workspace }}/MNN/build_mnn_static \
             -DMNN_SOURCE_DIR=${{ github.workspace }}/MNN \
             -DMNN_LIBRARY=${{ github.workspace }}/MNN/build_mnn_static/libMNN.a \
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
-            -DCMAKE_CXX_FLAGS="-DCPPHTTPLIB_OPENSSL_SUPPORT -DCPPHTTPLIB_ZLIB_SUPPORT -I${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
-            -DCMAKE_C_FLAGS="-I${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
+            -DCMAKE_CXX_FLAGS="-DCPPHTTPLIB_ZLIB_SUPPORT" \
 
       - name: Build
         run: |
