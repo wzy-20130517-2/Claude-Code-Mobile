@@ -102,9 +102,13 @@ jobs:
           curl -fsSL -o /tmp/openssl.tar.gz \
             https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz
           tar xzf /tmp/openssl.tar.gz -C /tmp
-          SRC=$(ls -d /tmp/openssl-3.0.15)
+          ls /tmp | head
+          SRC=$(find /tmp -maxdepth 1 -name 'openssl-*' -type d | head -1)
+          echo "解压目录: $SRC"
+          test -d "$SRC/include/openssl" || { echo "找不到 include/openssl"; find /tmp -maxdepth 3 -name 'err.h' 2>/dev/null | head; exit 1; }
           mkdir -p "$SYSROOT/usr/include"
           cp -r "$SRC/include/openssl" "$SYSROOT/usr/include/"
+          echo "拷贝后: $(ls "$SYSROOT/usr/include/openssl/" | wc -l) 个文件"
           # opensslconf.h / configuration.h 是 configure 产物，源码树里没有。
           # 用一个最小可用的替代：httplib 只用到少量符号，不需要真实配置值。
           if [ ! -f "$SYSROOT/usr/include/openssl/opensslconf.h" ]; then
