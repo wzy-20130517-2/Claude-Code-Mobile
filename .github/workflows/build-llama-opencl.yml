@@ -170,6 +170,24 @@ jobs:
           echo "仍有 N_SIMDWIDTH 64 的: $(grep -rl "N_SIMDWIDTH 64" . 2>/dev/null | wc -l)（应为 0）"
           grep -rn "N_SIMDWIDTH 16" . 2>/dev/null | head -3 || true
 
+      # 【v0.8.0 还有一道运行时 GPU family 检查】
+      # gated_delta_net 的初始化在启动时无条件执行：
+      #   sg_size = ADRENO ? 64 : INTEL ? 32 : -1
+      #   if (sg_size < 0) { GGML_LOG_ERROR("Unsupported GPU Family..."); exit(1); }
+      # Mali 两个都不是 → -1 → 整个后端 exit(1)，跟模型无关。
+      #
+      # 把 Mali 归到 INTEL 家族：Adreno 分支是 64，而 Mali 的 subgroup 是 16，
+      # 差太多；Intel 的 32 至少能让初始化往下走。实际跑不到 gated_delta_net
+      # （特定架构的算子），常规 matmul 路径的宽度已由 kernel 层的
+      # N_SIMDWIDTH=16 控制。
+      - name: Let the OpenCL backend accept Mali at runtime
+        run: |
+          cd llama.cpp/ggml/src/ggml-opencl
+          # 补丁脚本以 base64 内联，避免在 YAML/shell/python 三层里反复转义引号
+          echo 'aW1wb3J0IHBhdGhsaWIsIHN5cwpwID0gcGF0aGxpYi5QYXRoKCdnZ21sLW9wZW5jbC5jcHAnKQpzID0gcC5yZWFkX3RleHQoKQoKb2xkID0gJycnICAgIH0gZWxzZSBpZiAoc3Ryc3RyKGRldl9jdHgtPmRldmljZV9uYW1lLmNfc3RyKCksICJJbnRlbCIpKSB7CiAgICAgICAgZGV2X2N0eC0+Z3B1X2ZhbWlseSA9IEdQVV9GQU1JTFk6OklOVEVMOwogICAgfSBlbHNlIHsnJycKbmV3ID0gJycnICAgIH0gZWxzZSBpZiAoc3Ryc3RyKGRldl9jdHgtPmRldmljZV9uYW1lLmNfc3RyKCksICJJbnRlbCIpKSB7CiAgICAgICAgZGV2X2N0eC0+Z3B1X2ZhbWlseSA9IEdQVV9GQU1JTFk6OklOVEVMOwogICAgfSBlbHNlIGlmIChzdHJzdHIoZGV2X2N0eC0+ZGV2aWNlX25hbWUuY19zdHIoKSwgIk1hbGkiKSkgewogICAgICAgIGRldl9jdHgtPmdwdV9mYW1pbHkgPSBHUFVfRkFNSUxZOjpJTlRFTDsKICAgIH0gZWxzZSB7JycnCgppZiAnY19zdHIoKSwgIk1hbGkiKScgaW4gczoKICAgIHByaW50KCdhbHJlYWR5IE1hbGktcmVhZHknKQplbGlmIG9sZCBpbiBzOgogICAgcC53cml0ZV90ZXh0KHMucmVwbGFjZShvbGQsIG5ldywgMSkpCiAgICBwcmludCgncGF0Y2hlZDogTWFsaSAtPiBJTlRFTCBmYW1pbHknKQplbHNlOgogICAgcHJpbnQoJ2FuY2hvciBub3QgZm91bmQnLCBmaWxlPXN5cy5zdGRlcnIpCiAgICBzeXMuZXhpdCgxKQo=' | base64 -d > /tmp/patch.py
+          python3 /tmp/patch.py
+          grep -n 'c_str(), "Mali"' ggml-opencl.cpp
+
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         id: ndk
