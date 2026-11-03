@@ -52,6 +52,12 @@ jobs:
           cd MNN
           mkdir -p 3rd_party
           git clone --depth 1 https://github.com/bilibili/libyuv.git 3rd_party/libyuv
+          # libyuv 的 CMakeLists 第一行是 cmake_minimum_required(VERSION 3.0) 之类，
+          # 而 CMake 4.x 已经删掉了 <3.5 的兼容层，直接报
+          # "Compatibility with CMake < 3.5 has been removed"。
+          # 抬高下限即可，libyuv 本身没有用到任何被移除的老行为。
+          sed -i -E 's/^cmake_minimum_required\(VERSION [0-9.]+.*\)/cmake_minimum_required(VERSION 3.10)/' 3rd_party/libyuv/CMakeLists.txt
+          head -1 3rd_party/libyuv/CMakeLists.txt
 
       # 【坑】mnncli 的 CMakeLists 默认会去找 OpenCV，找不到直接报错。
       # 我们只要文本推理，不要图像能力，所以关掉它。
