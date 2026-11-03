@@ -71,7 +71,11 @@ jobs:
             -DMNN_OPENCV=OFF \
             -DMNN_BUILD_OPENCV=OFF \
             -DMNN_LOW_MEMORY=ON \
-            -DMNN_SUPPORT_TRANSFORMER_FUSE=ON
+            -DMNN_SUPPORT_TRANSFORMER_FUSE=ON \
+            -DOPENSSL_ROOT_DIR=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr \
+            -DOPENSSL_INCLUDE_DIR=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include \
+            -DOPENSSL_CRYPTO_LIBRARY=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libcrypto.so \
+            -DOPENSSL_SSL_LIBRARY=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libssl.so
 
       - name: Build
         run: |
