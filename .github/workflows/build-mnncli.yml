@@ -222,14 +222,24 @@ jobs:
 
       - name: Collect artifacts
         run: |
-          set -e
           mkdir -p out
-          find MNN/apps/mnncli/build_android -name 'mnncli' -type f -exec cp {} out/ \; 2>/dev/null || true
-          cp MNN/minirunner out/ 2>/dev/null || true
-          # 运行期要链接的 .so 一起打包，手机上不用另外找
-          find MNN/apps/mnncli/build_android -name '*.so' -type f -exec cp {} out/ \;
+          # minirunner 是这一版的主要产物；mnncli 编不出来也无所谓
+          if [ -f MNN/minirunner ]; then
+            cp MNN/minirunner out/
+            echo "minirunner: $(ls -lh out/minirunner | awk '{print $5}')"
+          else
+            echo "minirunner 没编出来"
+          fi
+          if [ -f MNN/apps/mnncli/build_android/mnncli ]; then
+            cp MNN/apps/mnncli/build_android/mnncli out/
+          fi
+          # 运行期要的 .so：MNN 静态链接了，但 c++_shared 和 liblog 之类要带
+          for so in MNN/apps/mnncli/build_android/*.so MNN/build_mnn_static/*.so; do
+            [ -f "$so" ] && cp "$so" out/ 2>/dev/null || true
+          done
           ls -lh out/
-          file out/mnncli | grep -q aarch64 || { echo '不是 arm64'; exit 1; }
+          test -f out/minirunner || { echo "没有产物"; exit 1; }
+          file out/minirunner | grep -q aarch64 || { echo '不是 arm64'; exit 1; }
           cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS
           tar czf ../mnncli-android-arm64.tar.gz *
 
