@@ -124,6 +124,18 @@ jobs:
           test -f "$SYSROOT/usr/include/openssl/err.h" && echo "err.h OK"
           test -f "$SYSROOT/usr/include/openssl/opensslconf.h" && echo "opensslconf.h OK"
 
+      # 【CMAKE_CXX_FLAGS 传不到子 target】
+      # MNN 的 CMake 结构里，httplib 是在 transformers/llm/engine 子项目里被包含的，
+      # 而那边会用自己的 flags 覆盖，-I 加不进去。
+      # 最省事：直接把 openssl 头拷到 httplib.h 所在目录旁边，
+      # 这样 `#include <openssl/err.h>` 会以该目录为基准解析到。
+      - name: Mirror OpenSSL headers next to httplib
+        run: |
+          SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+          cp -r "$SYSROOT/usr/include/openssl" MNN/transformers/llm/engine/src/
+          ls MNN/transformers/llm/engine/src/openssl/ | head -3
+          test -f MNN/transformers/llm/engine/src/openssl/err.h && echo "err.h 就位"
+
       - name: Configure
         run: |
           cd MNN/apps/mnncli
