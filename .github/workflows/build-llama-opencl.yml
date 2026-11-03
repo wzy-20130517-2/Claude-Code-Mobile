@@ -188,6 +188,24 @@ jobs:
           python3 /tmp/patch.py
           grep -n 'c_str(), "Mali"' ggml-opencl.cpp
 
+      # 【sg_size 的 -1 是一条死路】
+      # gated_delta_net 两处初始化都这样算：
+      #   sg_size = ADRENO ? 64 : INTEL ? 32 : -1;
+      #   if (sg_size < 0) { GGML_LOG_ERROR("Unsupported GPU Family..."); exit(1); }
+      # 前面虽然把 Mali 映射成 INTEL，但 gpu_family 在 buffer 分配那条初始化
+      # 路径上仍然是 UNKNOWN（两条路径到 load_cl_kernels，只覆盖了一条），
+      # 所以 sg_size 照样是 -1，整个后端直接 exit。
+      #
+      # 与其继续追 gpu_family 的赋值链，不如把这个兜底改掉：
+      # sg_size 兜底取 32，并删掉 exit。gated_delta_net 是特定架构的算子，
+      # 这个模型用不到；真正影响 matmul 的是 kernel 层的 N_SIMDWIDTH=16。
+      - name: Neutralize the sg_size exit in the OpenCL backend
+        run: |
+          cd llama.cpp/ggml/src/ggml-opencl
+          echo 'aW1wb3J0IHBhdGhsaWIsIHJlLCBzeXMKcCA9IHBhdGhsaWIuUGF0aCgnZ2dtbC1vcGVuY2wuY3BwJykKcyA9IHAucmVhZF90ZXh0KCkKCm9sZF9zZyA9ICc6IGJhY2tlbmRfY3R4LT5ncHVfZmFtaWx5ID09IEdQVV9GQU1JTFk6OklOVEVMID8gMzIgOiAtMTsnCm5ld19zZyA9ICc6IGJhY2tlbmRfY3R4LT5ncHVfZmFtaWx5ID09IEdQVV9GQU1JTFk6OklOVEVMID8gMzIgOiAzMjsnCm4gPSBzLmNvdW50KG9sZF9zZykKaWYgbiA9PSAwOgogICAgcHJpbnQoJ+acquingSAtMSDlhZzlupXvvIjlj6/og73lt7LmiZPov4fvvIknKQplbHNlOgogICAgcyA9IHMucmVwbGFjZShvbGRfc2csIG5ld19zZykKICAgIHByaW50KGYnc2dfc2l6ZSDlhZzlupXmlLnkuLogMzLvvIh7bn0g5aSE77yJJykKCiMg55So5q2j5YiZ5Yig5o6JIGV4aXQg5Z2X77yM5LiN5L6d6LWW57yp6L+bCnBhdCA9IHJlLmNvbXBpbGUoCiAgICByJ1sgXHRdKmlmIFwoc2dfc2l6ZSA8IDBcKSBce1xzKicKICAgIHInR0dNTF9MT0dfRVJST1JcKCJVbnN1cHBvcnRlZCBHUFUgRmFtaWx5W14iXSoiXCk7XHMqJwogICAgcidleGl0XCgxXCk7XHMqXH0nLCByZS5TKQpzMiwgbjIgPSBwYXQuc3VibignJywgcykKcHJpbnQoZifnp7vpmaQgZXhpdCDmo4Dmn6XvvIh7bjJ9IOWkhO+8iScpCgpwLndyaXRlX3RleHQoczIpCg==' | base64 -d > /tmp/patch2.py
+          python3 /tmp/patch2.py
+          echo "残留 Unsupported GPU Family 字符串: $(grep -c 'Unsupported GPU Family' ggml-opencl.cpp || true)"
+
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         id: ndk
