@@ -164,7 +164,8 @@ jobs:
             -DMNN_SOURCE_DIR=${{ github.workspace }}/MNN \
             -DMNN_LIBRARY=${{ github.workspace }}/MNN/build_mnn_static/libMNN.a \
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
-            -DCMAKE_CXX_FLAGS="-DCPPHTTPLIB_OPENSSL_SUPPORT -DCPPHTTPLIB_ZLIB_SUPPORT"
+            -DCMAKE_CXX_FLAGS="-DCPPHTTPLIB_OPENSSL_SUPPORT -DCPPHTTPLIB_ZLIB_SUPPORT -I${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
+            -DCMAKE_C_FLAGS="-I${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
 
       - name: Build
         run: |
