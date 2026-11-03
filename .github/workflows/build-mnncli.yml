@@ -115,6 +115,30 @@ jobs:
           echo "拷贝后: $(ls "$SYSROOT/usr/include/openssl/" | wc -l) 个文件"
           test -f "$SYSROOT/usr/include/openssl/err.h" && echo "err.h OK"
 
+          # opensslconf.h 是 configure 产物（源码树里只有 .in 模板，内容是 Perl），
+          # 1.1.1 里它主要是平台开关。手写一份 Android/aarch64 的最小配置：
+          # httplib 只用 SSL_CTX/SSL/SSL_read/SSL_write 这层 API，不涉及
+          # 引擎、FIPS、旧算法，所以只需要一句话的 64 位小端配置。
+          cat > "$SYSROOT/usr/include/openssl/opensslconf.h" <<'EOF_CONF'
+          /* 手写最小配置：Android aarch64，OpenSSL 1.1.1 头 + NDK 的 3.0 stub 库 */
+          #ifndef OPENSSL_CONFIGURED_API
+          # define OPENSSL_CONFIGURED_API 30000
+          #endif
+          #ifndef OPENSSL_SYS_ANDROID
+          # define OPENSSL_SYS_ANDROID 1
+          #endif
+          #ifndef OPENSSL_NO_STDIO
+          # define OPENSSL_NO_STDIO 1
+          #endif
+          /* 明确关掉我们不需要的子系统，减少头文件里的依赖 */
+          # ifndef OPENSSL_NO_DEPRECATED
+          #  define OPENSSL_NO_DEPRECATED
+          # endif
+          EOF_CONF
+          echo "opensslconf.h 已写"
+          # 镜像目录里也放一份，e_os2.h 会从那里找
+          cp "$SYSROOT/usr/include/openssl/opensslconf.h" "$SRC/include/openssl/" 2>/dev/null || true
+
       - name: Mirror OpenSSL headers next to httplib
         run: |
           SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
