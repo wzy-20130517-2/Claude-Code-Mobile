@@ -92,23 +92,33 @@ jobs:
       # NDK 的 sysroot 里有 libcrypto.so / libssl.so（stub），但没有 openssl/*.h。
       # mnncli 的 httplib 开了 CPPHTTPLIB_OPENSSL_SUPPORT 后会 #include 这些头，
       # 所以从 OpenSSL 官方仓库取一份对应版本的头文件体系。
+      # 【OpenSSL 头文件，NDK 只给库不给头】
+      # NDK sysroot 有 libcrypto/libssl 的 stub，但没有 openssl/*.h。
+      # 用 tarball 而不是 git clone：clone 整个 OpenSSL 仓库在这台 runner 上
+      # 要几分钟且经常超时，只要 include/openssl 那几十个头文件。
       - name: Provide OpenSSL headers
         run: |
           SYSROOT=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
-          git clone --depth 1 --branch openssl-3.0.15 \
-            https://github.com/openssl/openssl.git /tmp/openssl || \
-          git clone --depth 1 https://github.com/openssl/openssl.git /tmp/openssl
-          # 只需要 include/openssl 下的公共头
-          cp -r /tmp/openssl/include/openssl "$SYSROOT/usr/include/"
-          # 有生成头（configuration 产物），用现成的兜底
-          for h in configuration.h opensslconf.h; do
-            if [ ! -f "$SYSROOT/usr/include/openssl/$h" ]; then
-              found=$(find /tmp/openssl -name "$h" 2>/dev/null | head -1)
-              [ -n "$found" ] && cp "$found" "$SYSROOT/usr/include/openssl/"
-            fi
-          done
-          ls "$SYSROOT/usr/include/openssl/" | head -5
+          curl -fsSL -o /tmp/openssl.tar.gz \
+            https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz
+          tar xzf /tmp/openssl.tar.gz -C /tmp
+          SRC=$(ls -d /tmp/openssl-3.0.15)
+          mkdir -p "$SYSROOT/usr/include"
+          cp -r "$SRC/include/openssl" "$SYSROOT/usr/include/"
+          # opensslconf.h / configuration.h 是 configure 产物，源码树里没有。
+          # 用一个最小可用的替代：httplib 只用到少量符号，不需要真实配置值。
+          if [ ! -f "$SYSROOT/usr/include/openssl/opensslconf.h" ]; then
+            cat > "$SYSROOT/usr/include/openssl/opensslconf.h" <<'EOF_CONF'
+          /* 最小占位：httplib 编译期只需要这些开关存在 */
+          #ifndef OPENSSL_CONF_H
+          #define OPENSSL_CONF_H
+          #define OPENSSL_API_COMPAT 0x10100000L
+          #define OPENSSL_NO_DEPRECATED 1
+          #endif
+          EOF_CONF
+          fi
           test -f "$SYSROOT/usr/include/openssl/err.h" && echo "err.h OK"
+          test -f "$SYSROOT/usr/include/openssl/opensslconf.h" && echo "opensslconf.h OK"
 
       - name: Configure
         run: |
