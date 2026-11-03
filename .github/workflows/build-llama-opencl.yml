@@ -206,6 +206,19 @@ jobs:
           python3 /tmp/patch2.py
           echo "残留 Unsupported GPU Family 字符串: $(grep -c 'Unsupported GPU Family' ggml-opencl.cpp || true)"
 
+      # 【6 处 "Unsupported GPU" 断言】
+      # 这些算子的 subgroup 尺寸也是写死的二选一：
+      #   ADRENO ? 64 : INTEL ? 32 : GGML_ASSERT(false && "Unsupported GPU")
+      # 和前面的 exit 不同，这些是**每次推理都会走到的**（rms_norm_mul、
+      # group_norm、norm 一类），所以 Mali 一跑就 abort。
+      # 统一把兜底分支改成 sgs = 32。
+      - name: Replace the unsupported-GPU asserts with a 32 fallback
+        run: |
+          cd llama.cpp/ggml/src/ggml-opencl
+          echo 'aW1wb3J0IHBhdGhsaWIsIHJlLCBzeXMKcCA9IHBhdGhsaWIuUGF0aCgnZ2dtbC1vcGVuY2wuY3BwJykKcyA9IHAucmVhZF90ZXh0KCkKCiMg5b2i5byPIEHvvIjoirHmi6zlj7flnZfvvInvvJoKIyAgIH0gZWxzZSB7CiMgICAgICAgR0dNTF9BU1NFUlQoZmFsc2UgJiYgIlVuc3VwcG9ydGVkIEdQVSIpOwojICAgfQpwYXRfYSA9IHJlLmNvbXBpbGUoCiAgICByJ1x9WyBcdF0qZWxzZVsgXHRdKlx7XHMqR0dNTF9BU1NFUlRcKGZhbHNlICYmICJVbnN1cHBvcnRlZCBHUFUiXCk7XHMqXH0nKQojIOW9ouW8jyBC77yI5Y2V6KGMIGVsc2XvvInvvJoKIyAgIGVsc2UgR0dNTF9BU1NFUlQoZmFsc2UgJiYgIlVuc3VwcG9ydGVkIEdQVSIpOwpwYXRfYiA9IHJlLmNvbXBpbGUocidlbHNlWyBcdF0rR0dNTF9BU1NFUlRcKGZhbHNlICYmICJVbnN1cHBvcnRlZCBHUFUiXCk7JykKCmFfY291bnQgPSBsZW4ocGF0X2EuZmluZGFsbChzKSkKYl9jb3VudCA9IGxlbihwYXRfYi5maW5kYWxsKHMpKQpwcmludChmJ+W9ouW8jyBB77yI6Iqx5ous5Y+35Z2X77yJOiB7YV9jb3VudH0g5aSEJykKcHJpbnQoZiflvaLlvI8gQu+8iOWNleihjCBlbHNl77yJOiB7Yl9jb3VudH0g5aSEJykKCnMgPSBwYXRfYS5zdWIoJ30gZWxzZSB7XG4gICAgICAgIHNncyA9IDMyO1xuICAgIH0nLCBzKQpzID0gcGF0X2Iuc3ViKCdlbHNlIHNncyA9IDMyOycsIHMpCgpsZWZ0ID0gcy5jb3VudCgnIlVuc3VwcG9ydGVkIEdQVSInKQpwcmludChmJ+WkhOeQhuWQjuaui+eVmToge2xlZnR9IOWkhCcpCnAud3JpdGVfdGV4dChzKQo=' | base64 -d > /tmp/patch3.py
+          python3 /tmp/patch3.py
+          echo "残留断言: $(grep -c 'Unsupported GPU' ggml-opencl.cpp || true)（应为 0）"
+
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         id: ndk
