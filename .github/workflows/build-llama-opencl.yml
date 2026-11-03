@@ -219,6 +219,22 @@ jobs:
           python3 /tmp/patch3.py
           echo "残留断言: $(grep -c 'Unsupported GPU' ggml-opencl.cpp || true)（应为 0）"
 
+      # 【33 处 "TODO: Unknown GPU"】
+      # 几乎所有 matmul 分支都是三段式：
+      #   if (INTEL) {...} else if (ADRENO) {...} else { GGML_ASSERT(false && "TODO: Unknown GPU"); }
+      # 前面虽然把 Mali 映射成 INTEL，但 gpu_family 在 buffer 分配那条路径上
+      # 仍是 UNKNOWN，所以这些断言照样会触发（Q4_0 matmul 就是其中之一，
+      # 而 Q4_K_M 模型里含 Q4_0 块，必走）。
+      #
+      # 做法：把第一段的判断放宽成 (INTEL || UNKNOWN)，Mali 复用 Intel 的参数
+      # （nth0=32 那套），同时删掉已不可达的 else 断言。
+      - name: Route unknown GPU family through the Intel branches
+        run: |
+          cd llama.cpp/ggml/src/ggml-opencl
+          echo 'aW1wb3J0IHJlLCBwYXRobGliLCBzeXMKcCA9IHBhdGhsaWIuUGF0aCgnZ2dtbC1vcGVuY2wuY3BwJykKcyA9IHAucmVhZF90ZXh0KCkKCnBhdCA9IHJlLmNvbXBpbGUoCiAgICByJ2lmIFwoYmFja2VuZF9jdHgtPmdwdV9mYW1pbHkgPT0gSU5URUxcKShccypceyknCiAgICByJyguKj8pJwogICAgcidcfVxzKmVsc2UgaWYgXChiYWNrZW5kX2N0eC0+Z3B1X2ZhbWlseSA9PSBBRFJFTk9cKSAoXHspJwogICAgcicoLio/KScKICAgIHInXH1ccyplbHNlIFx7XHMqR0dNTF9BU1NFUlRcKGZhbHNlICYmICJUT0RPOiBVbmtub3duIEdQVSJcKTtccypcfScsCiAgICByZS5TKQoKZGVmIHJlcGwobSk6CiAgICBpbnRlbF9vcGVuLCBpbnRlbF9ib2R5LCBhZHJlbm9fb3BlbiwgYWRyZW5vX2JvZHkgPSBtLmdyb3VwcygpCiAgICByZXR1cm4gKGYnaWYgKGJhY2tlbmRfY3R4LT5ncHVfZmFtaWx5ID09IElOVEVMIHx8IGJhY2tlbmRfY3R4LT5ncHVfZmFtaWx5ID09IEdQVV9GQU1JTFk6OlVOS05PV04pe2ludGVsX29wZW59JwogICAgICAgICAgICBmJ3tpbnRlbF9ib2R5fX19IGVsc2UgaWYgKGJhY2tlbmRfY3R4LT5ncHVfZmFtaWx5ID09IEFEUkVOTykge2FkcmVub19vcGVufScKICAgICAgICAgICAgZid7YWRyZW5vX2JvZHl9fX0nKQoKbmV3LCBuID0gcGF0LnN1Ym4ocmVwbCwgcykKcHJpbnQoZiforqkgTWFsaSDotbAgSW50ZWwg5YiG5pSvOiB7bn0g5aSEJykKbGVmdCA9IG5ldy5jb3VudCgnVE9ETzogVW5rbm93biBHUFUnKQpwcmludChmJ+aui+eVmSBUT0RPOiBVbmtub3duIEdQVToge2xlZnR9JykKaWYgbiA9PSAwOgogICAgcHJpbnQoJ+ayoeacieWMuemFje+8jOWPr+iDveW3sue7j+aJk+i/hycsIGZpbGU9c3lzLnN0ZGVycikKcC53cml0ZV90ZXh0KG5ldykK' | base64 -d > /tmp/patch4.py
+          python3 /tmp/patch4.py
+          echo "核对括号: $(grep -o '{' ggml-opencl.cpp | wc -l) / $(grep -o '}' ggml-opencl.cpp | wc -l)"
+
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         id: ndk
