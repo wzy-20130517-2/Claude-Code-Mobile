@@ -101,7 +101,11 @@ jobs:
             -DOPENSSL_ROOT_DIR=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr \
             -DOPENSSL_INCLUDE_DIR=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include \
             -DOPENSSL_CRYPTO_LIBRARY=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libcrypto.so \
-            -DOPENSSL_SSL_LIBRARY=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libssl.so
+            -DOPENSSL_SSL_LIBRARY=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libssl.so \
+            -DMNN_BUILD_DIR=${{ github.workspace }}/MNN/build_mnn_static \
+            -DMNN_SOURCE_DIR=${{ github.workspace }}/MNN \
+            -DMNN_LIBRARY=${{ github.workspace }}/MNN/build_mnn_static/libMNN.a \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH
 
       - name: Build
         run: |
