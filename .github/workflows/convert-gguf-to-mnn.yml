@@ -64,8 +64,10 @@ jobs:
           # target 名在官方 CMake 里是 MNNConvert，编不出来就退回全量编
           cmake --build build --target MNNConvert -j$(nproc) || \
             cmake --build build -j$(nproc) -- -k
-          MC=$(find build -name 'MNNConvert' -type f | head -1)
-          [ -z "$MC" ] && MC=$(find build -name 'mnnconvert' -type f | head -1)
+          # 必须是绝对路径：后面 Convert 步骤会 cd 到 conv/，
+          # 相对路径 build/MNNConvert 到那里就失效了（FileNotFoundError）。
+          MC=$(find "$PWD/build" -name 'MNNConvert' -type f | head -1)
+          [ -z "$MC" ] && MC=$(find "$PWD/build" -name 'mnnconvert' -type f | head -1)
           test -n "$MC" || { echo "MNNConvert 没编出来"; find build -name '*onvert*' | head; exit 1; }
           chmod +x "$MC"
           echo "MNNCONVERT=$MC" >> $GITHUB_ENV
