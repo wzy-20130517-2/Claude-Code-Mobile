@@ -85,8 +85,12 @@ jobs:
             -DMNN_LOW_MEMORY=ON \
             -DMNN_SUPPORT_TRANSFORMER_FUSE=ON \
             -DMNN_KLEIDIAI=ON
-          cmake --build build_mnn_static --target MNN -j$(nproc)
+          # 注意：只编 MNN 这个 target 拿不到 LLM 层。
+          # Llm::createLLM / response / destroy 都在 transformers/llm/engine 里，
+          # 对应独立的 target `llm`（见该目录 CMakeLists 的 add_library(llm ...)）。
+          cmake --build build_mnn_static --target MNN llm -j$(nproc)
           ls -lh build_mnn_static/libMNN.a
+          find build_mnn_static -name 'libllm.a' -o -name 'libllm*.a' | head
 
       # 【OpenSSL 头文件，NDK 只给库不给头】
       # NDK 的 sysroot 里有 libcrypto.so / libssl.so（stub），但没有 openssl/*.h。
@@ -217,6 +221,7 @@ jobs:
             minirunner.cpp \
             -o minirunner \
             -Wl,--whole-archive build_mnn_static/libMNN.a -Wl,--no-whole-archive \
+            $(find build_mnn_static -name 'libllm.a' | head -1) \
             -llog -landroid -lz -ldl -lm -static-libstdc++ 2>&1 | tail -20
           ls -lh minirunner 2>/dev/null || echo "链接失败"
 
