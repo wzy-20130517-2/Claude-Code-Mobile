@@ -1,0 +1,177 @@
+name: Convert GGUF to MNN
+
+# 目的：把 Spark-X2.6-4B 的 GGUF 转成 MNN 格式，好在手机上用 mnncli/minirunner 跑。
+#
+# 【为什么必须在 CI 里做】
+# 转换最后一步要调 mnnconvert（MNN 的模型编译器），官方只提供 x86_64 Linux 版，
+# Termux 是 aarch64，跑不了。前面所有步骤（拆 qkv、解量化）都能在手机做，
+# 只有这一步需要 x86。
+#
+# 【为什么需要拆 qkv】
+# Spark 用合并的 attn_qkv（2560×6144），而 MNN 的模板期望分开的 q/k/v。
+# 按超参算：head=16, kv_head=4, key_len=val_len=256
+#   q = 16×256 = 4096, k = 4×256 = 1024, v = 4×256 = 1024，合计 6144 ✓
+# GGUF 里 attn_qkv 存成 (6144, 2100) 的 uint8 块（每行一个 2560 维向量的 Q4_K 编码），
+# 所以沿 axis 0 切就行，字节原样搬，不用反量化。
+#
+# 【Q5_K 的坑】
+# gguf2mnn 不支持 Q5_K，而 gguf 库的 quantize 没实现 Q6_K。
+# Spark 有 4 个 ffn_up 是 Q5_K，反量化后存 F16 绕过（精度不降）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      gguf_url:
+        description: '源 GGUF 的下载地址'
+        required: true
+        default: 'https://hf-mirror.com/XHToken/Spark-X2.6-4B-GGUF/resolve/main/Spark-X2.6-4B-Q4_K_M.gguf'
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout this repo (for the convert scripts)
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install python deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install numpy gguf
+
+      # MNN 官方 x86_64 release 里有 mnnconvert
+      - name: Fetch MNN toolchain (x86_64)
+        run: |
+          curl -fsSL -o /tmp/mnn.zip \
+            https://github.com/alibaba/MNN/releases/download/3.6.2/mnn_3.6.2_linux_x64_cpu_opencl_vulkan.zip
+          unzip -q /tmp/mnn.zip -d /tmp/mnn
+          find /tmp/mnn -name 'mnnconvert' -type f -exec chmod +x {} \;
+          MC=$(find /tmp/mnn -name 'mnnconvert' -type f | head -1)
+          echo "mnnconvert: $MC"
+          "$MC" --version || true
+          echo "MNNCONVERT=$MC" >> $GITHUB_ENV
+
+      - name: Download the GGUF
+        if: inputs.gguf_url != ''
+        run: |
+          curl -fL --retry 3 -o /tmp/src.gguf "${{ inputs.gguf_url }}"
+          ls -lh /tmp/src.gguf
+
+      - name: "Download the MNN template (Qwen2.5-3B: same 36 layers x 2 LN)"
+        run: |
+          mkdir -p work
+          BASE=https://hf-mirror.com/taobao-mnn/Qwen2.5-3B-Instruct-MNN/resolve/main
+          for f in llm.mnn.json llm_config.json config.json; do
+            curl -fL --retry 3 -o "work/$f" "$BASE/$f"
+            echo "  $f: $(wc -c < work/$f) bytes"
+          done
+
+      - name: Split attn_qkv and downgrade Q5_K
+        run: |
+          cat > split.py <<'PY'
+          import numpy as np, os, sys
+          from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
+          from gguf.quants import dequantize
+
+          SRC, DST = '/tmp/src.gguf', '/tmp/split.gguf'
+          Q, K, V = 4096, 1024, 1024
+
+          r = GGUFReader(SRC)
+          w = GGUFWriter(DST, arch='spark2_5')
+
+          for key, field in r.fields.items():
+              if key.startswith('GGUF.'):
+                  continue
+              try:
+                  v = field.parts[field.data[0]]
+                  dt = field.data.dtype
+                  if dt == np.dtype('uint8'):
+                      val = v.tobytes().decode('utf-8', 'ignore')
+                  elif dt == np.dtype('int32'):
+                      val = int(np.frombuffer(v.tobytes(), dtype=np.int32)[0])
+                  elif dt == np.dtype('uint32'):
+                      val = int(np.frombuffer(v.tobytes(), dtype=np.uint32)[0])
+                  elif dt == np.dtype('float32'):
+                      val = float(np.frombuffer(v.tobytes(), dtype=np.float32)[0])
+                  elif dt == np.dtype('bool'):
+                      val = bool(v.tobytes()[0])
+                  else:
+                      val = v.tobytes().decode('utf-8', 'ignore')
+                  w.add_key_value(key, val)
+              except Exception:
+                  pass
+
+          n_qkv = n_q5 = 0
+          for t in r.tensors:
+              if t.name.endswith('attn_qkv.weight'):
+                  base = t.name[:-len('attn_qkv.weight')]
+                  b = t.data
+                  assert b.shape[0] == Q + K + V, f'{t.name}: {b.shape[0]} != {Q+K+V}'
+                  for suf, arr in (('attn_q', b[:Q]), ('attn_k', b[Q:Q+K]), ('attn_v', b[Q+K:])):
+                      w.add_tensor(base + suf + '.weight', np.ascontiguousarray(arr), raw_dtype=t.tensor_type)
+                  n_qkv += 1
+              elif int(t.tensor_type) == 13:   # Q5_K -> F16
+                  arr = dequantize(t.data, GGMLQuantizationType.Q5_K).astype(np.float16)
+                  w.add_tensor(t.name, np.ascontiguousarray(arr), raw_dtype=GGMLQuantizationType.F16)
+                  n_q5 += 1
+              else:
+                  w.add_tensor(t.name, t.data, raw_dtype=t.tensor_type)
+
+          print(f'split qkv: {n_qkv} layers, Q5_K->F16: {n_q5}')
+          w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+          print('output:', DST, os.path.getsize(DST)//1024//1024, 'MB')
+          PY
+          python3 split.py
+
+      # gguf2mnn.py 在 MNN 仓库里，单独拉一份
+      - name: Fetch gguf2mnn
+        run: |
+          BASE=https://raw.githubusercontent.com/alibaba/MNN/3.6.2/transformers/llm/export
+          mkdir -p conv/utils
+          curl -fL -o conv/gguf2mnn.py "$BASE/gguf2mnn.py"
+          curl -fL -o conv/utils/mnn_utils.py "$BASE/utils/mnn_utils.py"
+          touch conv/utils/__init__.py
+          wc -l conv/gguf2mnn.py conv/utils/mnn_utils.py
+
+      # gguf2mnn 最后会 `from MNN.tools import mnnconvert`，而我们用的是外部二进制。
+      # 打个小补丁让它直接调用 $MNNCONVERT。
+      - name: Patch gguf2mnn to use the external mnnconvert
+        run: |
+          # gguf2mnn 结尾是 `from MNN.tools import mnnconvert` + `mnnconvert.convert(args)`。
+          # 那是 MNN 源码树里的 Python 包，我们只有 x86 的 mnnconvert 二进制，
+          # 所以替换成直接 exec 它（convert_args[0] 是空串，去掉）。
+          echo 'aW1wb3J0IHBhdGhsaWIKcCA9IHBhdGhsaWIuUGF0aCgnY29udi9nZ3VmMm1ubi5weScpCnMgPSBwLnJlYWRfdGV4dCgpCm9sZCA9ICIiIiAgICBmcm9tIE1OTi50b29scyBpbXBvcnQgbW5uY29udmVydAogICAgbW5uY29udmVydC5jb252ZXJ0KGNvbnZlcnRfYXJncykiIiIKbmV3ID0gIiIiICAgIGltcG9ydCBzdWJwcm9jZXNzCiAgICBfbWMgPSBvcy5lbnZpcm9uLmdldCgnTU5OQ09OVkVSVCcpCiAgICBhc3NlcnQgX21jLCAnTU5OQ09OVkVSVCBub3Qgc2V0JwogICAgX2FyZ3YgPSBbYSBmb3IgYSBpbiBjb252ZXJ0X2FyZ3MgaWYgYV0KICAgIHByaW50KCdydW5uaW5nOicsIF9tYywgJyAnLmpvaW4oX2FyZ3YpKQogICAgc3VicHJvY2Vzcy5ydW4oW19tY10gKyBfYXJndiwgY2hlY2s9VHJ1ZSkiIiIKaWYgb2xkIG5vdCBpbiBzOgogICAgcmFpc2UgU3lzdGVtRXhpdCgnYW5jaG9yIG5vdCBmb3VuZCcpCnAud3JpdGVfdGV4dChzLnJlcGxhY2Uob2xkLCBuZXcsIDEpKQpwcmludCgncGF0Y2hlZCcpCg==' | base64 -d > /tmp/patch_mc.py
+          python3 /tmp/patch_mc.py
+          grep -n "subprocess.run" conv/gguf2mnn.py
+
+      - name: Convert
+        run: |
+          cd conv
+          PYTHONPATH=. python3 gguf2mnn.py --gguf /tmp/split.gguf --mnn_dir ${{ github.workspace }}/work 2>&1 | tail -30
+          ls -lh ${{ github.workspace }}/work/
+
+      - name: Package
+        run: |
+          cd work
+          ls -lh
+          # config.json 里补 tokenizer_file（模型自带配置里没有，Llm::load 会检查）
+          python3 - <<'PY'
+          import json
+          d = json.load(open('config.json'))
+          d.setdefault('tokenizer_file', 'tokenizer.txt')
+          json.dump(d, open('config.json', 'w'), indent=4, ensure_ascii=False)
+          print(json.dumps(d, indent=2, ensure_ascii=False)[:300])
+          PY
+          sha256sum * > SHA256SUMS
+          tar czf ../spark-mnn.tar.gz *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spark-x2.6-4b-mnn
+          path: spark-mnn.tar.gz
+          retention-days: 30

@@ -135,18 +135,9 @@ jobs:
           // 只要本地推理，不涉及下载/图像/TLS。
           #include <iostream>
           #include <string>
-          #include <cstdio>
           #include "llm/llm.hpp"
-          #include <MNN/MNNDefine.h>
 
           using MNN::Transformer::Llm;
-
-          // MNN 默认用 __android_log_print 输出，Termux 里看不到（没有 logcat）。
-          // 把日志重定向到 stderr，这样失败时能看到具体原因。
-          static void mnnLogHandler(const char* level, const char* fmt, va_list args) {
-              vfprintf(stderr, fmt, args);
-              fputc('\n', stderr);
-          }
 
           int main(int argc, char** argv) {
               if (argc < 2) {
@@ -154,7 +145,6 @@ jobs:
                   return 1;
               }
               const std::string prompt = argc > 2 ? argv[2] : "你好";
-              MNN::MNNSetLogger(mnnLogHandler);
               Llm* llm = Llm::createLLM(std::string(argv[1]));
               if (!llm) { std::cerr << "createLLM failed\n"; return 1; }
               if (!llm->load()) { std::cerr << "load failed\n"; return 1; }
