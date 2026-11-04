@@ -85,7 +85,8 @@ jobs:
             -DMNN_LOW_MEMORY=ON \
             -DMNN_SUPPORT_TRANSFORMER_FUSE=ON \
             -DMNN_KLEIDIAI=ON \
-            -DMNN_BUILD_LLM=ON
+            -DMNN_BUILD_LLM=ON \
+            -DMNN_SEP_BUILD=ON
           cmake --build build_mnn_static --target MNN -j$(nproc)
           ls -lh build_mnn_static/libMNN.a
 
