@@ -44,17 +44,32 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install numpy gguf
 
-      # MNN 官方 x86_64 release 里有 mnnconvert
-      - name: Fetch MNN toolchain (x86_64)
+      # 【mnnconvert 只能自己编】
+      # 官方 x64 release 是运行时库 + 示例，**不含 mnnconvert**。
+      # 来源里也没有单独的工具包，所以拉源码编这一个 target。
+      # x86 上编比 arm64 快得多，几分钟就够。
+      - name: Build mnnconvert from source
         run: |
-          curl -fsSL -o /tmp/mnn.zip \
-            https://github.com/alibaba/MNN/releases/download/3.6.2/mnn_3.6.2_linux_x64_cpu_opencl_vulkan.zip
-          unzip -q /tmp/mnn.zip -d /tmp/mnn
-          find /tmp/mnn -name 'mnnconvert' -type f -exec chmod +x {} \;
-          MC=$(find /tmp/mnn -name 'mnnconvert' -type f | head -1)
-          echo "mnnconvert: $MC"
-          "$MC" --version || true
+          git clone --depth 1 --branch 3.6.2 https://github.com/alibaba/MNN.git /tmp/MNN
+          cd /tmp/MNN
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMNN_BUILD_CONVERTER=ON \
+            -DMNN_BUILD_SHARED_LIBS=OFF \
+            -DMNN_OPENCL=OFF \
+            -DMNN_VULKAN=OFF \
+            -DMNN_BUILD_TRAIN=OFF \
+            -DMNN_BUILD_DEMO=OFF \
+            -DMNN_BUILD_TEST=OFF
+          # target 名在官方 CMake 里是 MNNConvert，编不出来就退回全量编
+          cmake --build build --target MNNConvert -j$(nproc) || \
+            cmake --build build -j$(nproc) -- -k
+          MC=$(find build -name 'MNNConvert' -type f | head -1)
+          [ -z "$MC" ] && MC=$(find build -name 'mnnconvert' -type f | head -1)
+          test -n "$MC" || { echo "MNNConvert 没编出来"; find build -name '*onvert*' | head; exit 1; }
+          chmod +x "$MC"
           echo "MNNCONVERT=$MC" >> $GITHUB_ENV
+          "$MC" --version || true
 
       - name: Download the GGUF
         if: inputs.gguf_url != ''
