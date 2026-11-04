@@ -85,12 +85,27 @@ jobs:
             -DMNN_LOW_MEMORY=ON \
             -DMNN_SUPPORT_TRANSFORMER_FUSE=ON \
             -DMNN_KLEIDIAI=ON
-          # 注意：只编 MNN 这个 target 拿不到 LLM 层。
-          # Llm::createLLM / response / destroy 都在 transformers/llm/engine 里，
-          # 对应独立的 target `llm`（见该目录 CMakeLists 的 add_library(llm ...)）。
-          cmake --build build_mnn_static --target MNN llm -j$(nproc)
+          cmake --build build_mnn_static --target MNN -j$(nproc)
           ls -lh build_mnn_static/libMNN.a
-          find build_mnn_static -name 'libllm.a' -o -name 'libllm*.a' | head
+
+          # 【LLM 层要单独构建】
+          # 根 CMakeLists 不包含 transformers/llm/engine 这个子目录，
+          # 所以 build_mnn_static 里根本没有 `llm` 这个 target
+          # （试过 --target llm，报 "No rule to make target"）。
+          # Llm::createLLM / response / destroy 全在这个目录自己的工程里，
+          # 必须进去单独 configure + build。
+          cd transformers/llm/engine
+          cmake -S . -B build_llm \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ inputs.arch }} \
+            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMNN_SOURCE_DIR=${{ github.workspace }}/MNN \
+            -DMNN_LIBRARY=${{ github.workspace }}/MNN/build_mnn_static/libMNN.a \
+            -DMNN_BUILD_SHARED_LIBS=OFF
+          cmake --build build_llm -j$(nproc)
+          find build_llm -name '*.a' | head
 
       # 【OpenSSL 头文件，NDK 只给库不给头】
       # NDK 的 sysroot 里有 libcrypto.so / libssl.so（stub），但没有 openssl/*.h。
@@ -221,7 +236,7 @@ jobs:
             minirunner.cpp \
             -o minirunner \
             -Wl,--whole-archive build_mnn_static/libMNN.a -Wl,--no-whole-archive \
-            $(find build_mnn_static -name 'libllm.a' | head -1) \
+            $(find transformers/llm/engine/build_llm -name '*.a' | tr '\n' ' ') \
             -llog -landroid -lz -ldl -lm -static-libstdc++ 2>&1 | tail -20
           ls -lh minirunner 2>/dev/null || echo "链接失败"
 
